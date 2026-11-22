@@ -7,13 +7,16 @@
 
 set -u
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
 
 # 颜色定义
 C_RESET="\033[0m"
 C_BOLD="\033[1m"
 C_DIM="\033[2m"
+C_ITALIC="\033[3m"
+C_UNDERLINE="\033[4m"
+C_BLACK="\033[30m"
 C_RED="\033[31m"
 C_GREEN="\033[32m"
 C_YELLOW="\033[33m"
@@ -1384,7 +1387,11 @@ probe_media_claude() {
 probe_media_gemini() {
     local stack="$1" out="$2"
     local html status="failed" cc=""
-    html=$(curl_exec_stack "$stack" -fsL --connect-timeout 6 --max-time 12 -A "$UA_CHROME" -H "Accept-Language: en-US,en;q=0.9" "https://gemini.google.com" 2>/dev/null || true)
+    html=$(curl_exec_stack "$stack" -fsL --compressed --connect-timeout 6 --max-time 12 \
+        -A "$UA_CHROME" \
+        -H "Accept-Language: en-US,en;q=0.9" \
+        -H "Cookie: SOCS=CAESHAgBEhIaAB" \
+        "https://gemini.google.com" 2>/dev/null || true)
     if [[ -n "$html" ]]; then
         cc=$(grep -oE '2,1,200,"[A-Z]{3}"' <<< "$html" 2>/dev/null | head -n1 | grep -oE '[A-Z]{3}' || true)
         if grep -q '45631641' <<< "$html" 2>/dev/null; then
@@ -1398,21 +1405,23 @@ probe_media_gemini() {
 
 probe_media_netflix() {
     local stack="$1" out="$2"
-    local c1 c2 loc cc="" status="failed"
-    c1=$(curl_exec_stack "$stack" -s -o /dev/null -w "%{http_code}" --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.netflix.com/title/81280792" 2>/dev/null || echo "000")
+    local r1 c1 u1 r2 c2 u2 cc="" status="failed"
+    r1=$(curl_exec_stack "$stack" -sL -o /dev/null -w "%{http_code}|%{url_effective}" --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.netflix.com/title/81280792" 2>/dev/null || echo "000|")
+    c1="${r1%%|*}"
+    u1="${r1#*|}"
     if [[ "$c1" == "200" ]]; then
         status="yes"
-        loc=$(curl_exec_stack "$stack" -sI --connect-timeout 5 --max-time 10 -A "$UA_CHROME" "https://www.netflix.com/title/80018499" 2>/dev/null | grep -i '^location:' | head -n1 || true)
-        cc=$(echo "$loc" | sed -nE 's/.*netflix\.com\/([a-zA-Z]{2})([-\/]|$).*/\1/p' | tr '[:lower:]' '[:upper:]')
+        cc=$(echo "$u1" | sed -nE 's/.*netflix\.com\/([a-zA-Z]{2})(-[a-zA-Z]+)?\/.*/\1/p' | tr '[:lower:]' '[:upper:]')
         [[ -z "$cc" ]] && cc="US"
     elif [[ "$c1" == "404" || "$c1" == "403" ]]; then
-        c2=$(curl_exec_stack "$stack" -s -o /dev/null -w "%{http_code}" --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.netflix.com/title/80018499" 2>/dev/null || echo "000")
+        r2=$(curl_exec_stack "$stack" -sL -o /dev/null -w "%{http_code}|%{url_effective}" --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.netflix.com/title/80018499" 2>/dev/null || echo "000|")
+        c2="${r2%%|*}"
+        u2="${r2#*|}"
         if [[ "$c2" == "200" ]]; then
             status="originals"
-            loc=$(curl_exec_stack "$stack" -sI --connect-timeout 5 --max-time 10 -A "$UA_CHROME" "https://www.netflix.com/title/80018499" 2>/dev/null | grep -i '^location:' | head -n1 || true)
-            cc=$(echo "$loc" | sed -nE 's/.*netflix\.com\/([a-zA-Z]{2})([-\/]|$).*/\1/p' | tr '[:lower:]' '[:upper:]')
+            cc=$(echo "$u2" | sed -nE 's/.*netflix\.com\/([a-zA-Z]{2})(-[a-zA-Z]+)?\/.*/\1/p' | tr '[:lower:]' '[:upper:]')
             [[ -z "$cc" ]] && cc="US"
-        elif [[ "$c2" == "403" ]]; then
+        elif [[ "$c2" == "403" || "$c1" == "403" ]]; then
             status="blocked"
         else
             status="failed"
@@ -1464,6 +1473,10 @@ probe_media_youtube() {
 
 probe_media_tiktok() {
     local stack="$1" out="$2"
+    if [[ "$stack" == "6" && -z "$ACTIVE_CURL_CFG" ]]; then
+        printf 'no_ipv6|N/A\n' > "$out"
+        return 0
+    fi
     local html cc="" status="failed"
     html=$(curl_exec_stack "$stack" -fsL --compressed --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.tiktok.com/" 2>/dev/null || true)
     if [[ -n "$html" ]]; then
@@ -1479,6 +1492,10 @@ probe_media_tiktok() {
 
 probe_media_prime() {
     local stack="$1" out="$2"
+    if [[ "$stack" == "6" && -z "$ACTIVE_CURL_CFG" ]]; then
+        printf 'no_ipv6|N/A\n' > "$out"
+        return 0
+    fi
     local html cc="" status="failed"
     html=$(curl_exec_stack "$stack" -fsL --compressed --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.primevideo.com/" 2>/dev/null || true)
     if [[ -n "$html" ]]; then
@@ -1497,10 +1514,28 @@ probe_media_prime() {
 probe_media_reddit() {
     local stack="$1" out="$2"
     local resp code body cc="" status="failed"
-    resp=$(curl_exec_stack "$stack" -sL --compressed --connect-timeout 6 --max-time 12 \
+    local -a res_opt=()
+    if [[ "$stack" == "6" && -z "$ACTIVE_CURL_CFG" ]]; then
+        local dual6=""
+        if command -v dig >/dev/null 2>&1; then
+            dual6=$(dig +short +time=2 +tries=1 AAAA dualstack.reddit.map.fastly.net 2>/dev/null | grep ':' | head -n1 || true)
+        fi
+        [[ -z "$dual6" ]] && dual6="2a04:4e42:400::396"
+        res_opt=("--resolve" "www.reddit.com:443:[${dual6}]")
+    fi
+    resp=$(curl_exec_stack "$stack" -sL --http2 --compressed --connect-timeout 6 --max-time 12 \
+        ${res_opt[@]+"${res_opt[@]}"} \
         -A "$UA_CHROME" \
+        -H "Accept: */*" \
+        -H "Accept-Language: en-US,en;q=0.9" \
         -H "Referer: https://www.reddit.com/" \
         -H "Origin: https://www.reddit.com" \
+        -H 'Sec-CH-UA: "Google Chrome";v="136", "Chromium";v="136", "Not.A/Brand";v="99"' \
+        -H 'Sec-CH-UA-Mobile: ?0' \
+        -H 'Sec-CH-UA-Platform: "Windows"' \
+        -H 'Sec-Fetch-Dest: empty' \
+        -H 'Sec-Fetch-Mode: cors' \
+        -H 'Sec-Fetch-Site: same-origin' \
         --write-out '\n%{http_code}' \
         "https://www.reddit.com/svc/shreddit/reddit-chat" 2>/dev/null || true)
     code=$(printf '%s' "$resp" | tail -n1 | tr -d '[:space:]')
@@ -1698,167 +1733,222 @@ scan_mail_port25() {
 }
 
 # ==============================================================================
-# 渲染辅助函数（评分条、标签、综合纯净度评级）
+# 渲染辅助函数（经典 72 列视觉风格：三色渐变评分条、色块标签、横向解锁矩阵）
 # ==============================================================================
 
+# 经典 48 列三色渐变风险条（绿 0-33% -> 黄 33-66% -> 红 66-100%，右侧定宽对齐风险等级）
 render_risk_bar() {
     local score="$1"
-    local filled=$(( score * 20 / 100 ))
-    (( filled > 20 )) && filled=20
-    (( filled < 0 )) && filled=0
-    local empty=$(( 20 - filled ))
+    (( score < 0 )) && score=0
+    (( score > 100 )) && score=100
 
-    local bar_color="$C_GREEN"
-    local label=""
+    local risk_label=""
     if (( score < 20 )); then
-        bar_color="$C_GREEN"
-        [[ "$LANG_CODE" == "en" ]] && label="Very Low" || label="极低风险"
+        [[ "$LANG_CODE" == "en" ]] && risk_label="${C_GREEN}${C_BOLD}VeryLow${C_RESET}" || risk_label="${C_GREEN}${C_BOLD}极低风险${C_RESET}"
     elif (( score < 40 )); then
-        bar_color="$C_GREEN"
-        [[ "$LANG_CODE" == "en" ]] && label="Low" || label="低风险"
+        [[ "$LANG_CODE" == "en" ]] && risk_label="${C_GREEN}${C_BOLD}Low${C_RESET}" || risk_label="${C_GREEN}${C_BOLD}低风险${C_RESET}"
     elif (( score < 65 )); then
-        bar_color="$C_YELLOW"
-        [[ "$LANG_CODE" == "en" ]] && label="Medium" || label="中风险"
+        [[ "$LANG_CODE" == "en" ]] && risk_label="${C_YELLOW}${C_BOLD}Medium${C_RESET}" || risk_label="${C_YELLOW}${C_BOLD}中风险${C_RESET}"
     elif (( score < 85 )); then
-        bar_color="$C_RED"
-        [[ "$LANG_CODE" == "en" ]] && label="High" || label="高风险"
+        [[ "$LANG_CODE" == "en" ]] && risk_label="${C_RED}${C_BOLD}High${C_RESET}" || risk_label="${C_RED}${C_BOLD}高风险${C_RESET}"
     else
-        bar_color="$C_RED"
-        [[ "$LANG_CODE" == "en" ]] && label="Very High" || label="极高风险"
+        [[ "$LANG_CODE" == "en" ]] && risk_label="${C_RED}${C_BOLD}VeryHigh${C_RESET}" || risk_label="${C_RED}${C_BOLD}极高风险${C_RESET}"
     fi
 
-    local bar_fill="" bar_empty="" i
-    for (( i=0; i<filled; i++ )); do bar_fill+="#"; done
-    for (( i=0; i<empty; i++ )); do bar_empty+="-"; done
+    local text="${score}|"
+    local tlen=${#text}
+    local fill_len=$(( score * 48 / 100 ))
+    (( fill_len < tlen )) && fill_len=$tlen
+    (( fill_len > 48 )) && fill_len=48
 
-    printf "%b[%s%s]%b %3d/100 (%b%s%b)" "$bar_color" "$bar_fill" "$bar_empty" "$C_RESET" "$score" "$bar_color$C_BOLD" "$label" "$C_RESET"
+    local left_pad=$(( fill_len - tlen ))
+    local right_pad=$(( 48 - fill_len ))
+    local filled_str empty_str
+    filled_str="$(printf '%*s' "$left_pad" '')${text}"
+    empty_str="$(printf '%*s' "$right_pad" '')"
+
+    local s1="${filled_str:0:16}"
+    local s2="${filled_str:16:16}"
+    local s3="${filled_str:32:16}"
+
+    local out=""
+    [[ -n "$s1" ]] && out+="${BG_GREEN}${C_WHITE}${C_BOLD}${s1}"
+    [[ -n "$s2" ]] && out+="${BG_YELLOW}${C_WHITE}${C_BOLD}${s2}"
+    [[ -n "$s3" ]] && out+="${BG_RED}${C_WHITE}${C_BOLD}${s3}"
+    out+="${C_RESET}${empty_str} ${risk_label}"
+    printf "%b" "$out"
 }
 
-# 每个布尔单元格严格占用 9 个显示列宽，确保中英文表格绝对对齐
-render_bool_cell() {
+# 12 列定宽色块类型标签（用于「二、IP类型属性」横向矩阵）
+render_type_cell() {
+    local raw="$1"
+    local low
+    low=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
+    if [[ "$LANG_CODE" == "en" ]]; then
+        case "$low" in
+            isp|residential|"fixed line isp")
+                printf "   ${BG_GREEN}${C_WHITE}${C_BOLD} ISP ${C_RESET}    " ;;
+            mobile|wireless)
+                printf " ${BG_GREEN}${C_WHITE}${C_BOLD} Mobile ${C_RESET}  " ;;
+            business|commercial)
+                printf "${BG_YELLOW}${C_WHITE}${C_BOLD} Business ${C_RESET} " ;;
+            hosting|datacenter)
+                printf " ${BG_RED}${C_WHITE}${C_BOLD} Hosting ${C_RESET} " ;;
+            vpn)
+                printf "   ${BG_RED}${C_WHITE}${C_BOLD} VPN ${C_RESET}    " ;;
+            socks*|proxy|compromised)
+                printf "  ${BG_RED}${C_WHITE}${C_BOLD} Proxy ${C_RESET}  " ;;
+            education)
+                printf "${BG_YELLOW}${C_WHITE}${C_BOLD} Education ${C_RESET}" ;;
+            government)
+                printf "${BG_YELLOW}${C_WHITE}${C_BOLD}   Gov.    ${C_RESET}" ;;
+            ""|null|unknown)
+                printf "   ${C_DIM}  -  ${C_RESET}    " ;;
+            *)
+                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} Other ${C_RESET}  " ;;
+        esac
+    else
+        case "$low" in
+            isp|residential|"fixed line isp")
+                printf "  ${BG_GREEN}${C_WHITE}${C_BOLD} 家宽 ${C_RESET}    " ;;
+            mobile|wireless)
+                printf "  ${BG_GREEN}${C_WHITE}${C_BOLD} 移动 ${C_RESET}    " ;;
+            business|commercial)
+                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} 商业 ${C_RESET}    " ;;
+            hosting|datacenter)
+                printf "  ${BG_RED}${C_WHITE}${C_BOLD} 机房 ${C_RESET}    " ;;
+            vpn)
+                printf "  ${BG_RED}${C_WHITE}${C_BOLD} VPN  ${C_RESET}    " ;;
+            socks*|proxy|compromised)
+                printf "  ${BG_RED}${C_WHITE}${C_BOLD} 代理 ${C_RESET}    " ;;
+            education)
+                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} 教育 ${C_RESET}    " ;;
+            government)
+                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} 政府 ${C_RESET}    " ;;
+            ""|null|unknown)
+                printf "    ${C_DIM}无${C_RESET}      " ;;
+            *)
+                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} 其他 ${C_RESET}    " ;;
+        esac
+    fi
+}
+
+# 10 列定宽风险因子单元格（[US] / 是 / 否 / 无）
+render_factor_cc() {
+    local cc="$1"
+    if [[ -n "$cc" && "$cc" != "N/A" && "$cc" != "null" && ${#cc} -eq 2 ]]; then
+        printf "  ${C_GREEN}[%s]${C_RESET}    " "$cc"
+    else
+        if [[ "$LANG_CODE" == "en" ]]; then
+            printf "   ${C_DIM}N/A${C_RESET}    "
+        else
+            printf "   ${C_GREEN}无${C_RESET}     "
+        fi
+    fi
+}
+
+render_factor_bool() {
     local val="$1"
     case "$val" in
         true|yes|1)
             if [[ "$LANG_CODE" == "en" ]]; then
-                printf "${C_RED}${C_BOLD}Yes      ${C_RESET}"
+                printf "   ${C_RED}${C_BOLD}Yes${C_RESET}    "
             else
-                printf "${C_RED}${C_BOLD}是       ${C_RESET}"
+                printf "   ${C_RED}${C_BOLD}是${C_RESET}     "
             fi
             ;;
         false|no|0)
             if [[ "$LANG_CODE" == "en" ]]; then
-                printf "${C_GREEN}No       ${C_RESET}"
+                printf "   ${C_GREEN}${C_BOLD}No${C_RESET}     "
             else
-                printf "${C_GREEN}否       ${C_RESET}"
+                printf "   ${C_GREEN}${C_BOLD}否${C_RESET}     "
             fi
             ;;
         *)
-            printf "${C_DIM}N/A      ${C_RESET}"
+            if [[ "$LANG_CODE" == "en" ]]; then
+                printf "   ${C_GREEN}N/A${C_RESET}    "
+            else
+                printf "   ${C_GREEN}无${C_RESET}     "
+            fi
             ;;
     esac
 }
 
-render_type_badge() {
-    local raw="$1"
-    local low
-    low=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
-    case "$low" in
-        isp|residential|"fixed line isp")
-            [[ "$LANG_CODE" == "en" ]] && echo -e "${BG_GREEN}${C_WHITE}${C_BOLD} Residential/ISP ${C_RESET}" || echo -e "${BG_GREEN}${C_WHITE}${C_BOLD} 家宽/ISP ${C_RESET}"
-            ;;
-        mobile|wireless)
-            [[ "$LANG_CODE" == "en" ]] && echo -e "${BG_GREEN}${C_WHITE}${C_BOLD} Mobile/Wireless ${C_RESET}" || echo -e "${BG_GREEN}${C_WHITE}${C_BOLD} 移动/无线 ${C_RESET}"
-            ;;
-        business|commercial)
-            [[ "$LANG_CODE" == "en" ]] && echo -e "${BG_YELLOW}${C_WHITE}${C_BOLD} Business ${C_RESET}" || echo -e "${BG_YELLOW}${C_WHITE}${C_BOLD} 商业/企业 ${C_RESET}"
-            ;;
-        hosting|datacenter|vpn|socks*|proxy|compromised)
-            [[ "$LANG_CODE" == "en" ]] && echo -e "${BG_RED}${C_WHITE}${C_BOLD} ${raw} ${C_RESET}" || echo -e "${BG_RED}${C_WHITE}${C_BOLD} 机房/${raw} ${C_RESET}"
-            ;;
-        education)
-            [[ "$LANG_CODE" == "en" ]] && echo -e "${BG_BLUE}${C_WHITE}${C_BOLD} Education ${C_RESET}" || echo -e "${BG_BLUE}${C_WHITE}${C_BOLD} 教育网 ${C_RESET}"
-            ;;
-        ""|null|unknown)
-            echo -e "${C_DIM}N/A${C_RESET}"
-            ;;
-        *)
-            echo -e "${C_YELLOW}${raw}${C_RESET}"
-            ;;
-    esac
-}
-
-# 渲染单列定宽流媒体/AI 状态（按可见字符宽度补齐空格，避免 ANSI 转义符与中文宽字符破坏对齐）
-render_media_cell() {
+# 8 列定宽流媒体/AI 色块状态标签（横向矩阵）
+render_media_badge_8() {
     local status="$1"
-    local region="$2"
-    local target_width="${3:-22}"
-    local reg_str=""
-    [[ -n "$region" && "$region" != "N/A" ]] && reg_str=" [${region}]"
+    if [[ "$LANG_CODE" == "en" ]]; then
+        case "$status" in
+            yes)       printf " ${BG_GREEN}${C_WHITE}${C_BOLD} Yes  ${C_RESET} " ;;
+            originals) printf "${BG_YELLOW}${C_WHITE}${C_BOLD} Orig.  ${C_RESET}" ;;
+            api_only)  printf "${BG_YELLOW}${C_WHITE}${C_BOLD} APIOnl ${C_RESET}" ;;
+            no_prem)   printf "${BG_RED}${C_WHITE}${C_BOLD} NoPrem ${C_RESET}" ;;
+            blocked)   printf " ${BG_RED}${C_WHITE}${C_BOLD} Block${C_RESET} " ;;
+            no_ipv6)   printf " ${C_DIM}[NoV6]${C_RESET} " ;;
+            *)         printf " ${BG_RED}${C_WHITE}${C_BOLD} Fail ${C_RESET} " ;;
+        esac
+    else
+        case "$status" in
+            yes)       printf " ${BG_GREEN}${C_WHITE}${C_BOLD} 解锁 ${C_RESET} " ;;
+            originals) printf "${BG_YELLOW}${C_WHITE}${C_BOLD} 仅自制 ${C_RESET}" ;;
+            api_only)  printf "${BG_YELLOW}${C_WHITE}${C_BOLD} 仅API  ${C_RESET}" ;;
+            no_prem)   printf "${BG_RED}${C_WHITE}${C_BOLD} 禁会员 ${C_RESET}" ;;
+            blocked)   printf " ${BG_RED}${C_WHITE}${C_BOLD} 屏蔽 ${C_RESET} " ;;
+            no_ipv6)   printf " ${C_DIM}[无V6]${C_RESET} " ;;
+            *)         printf " ${BG_RED}${C_WHITE}${C_BOLD} 失败 ${C_RESET} " ;;
+        esac
+    fi
+}
 
-    local colored="" vis_len=0
-    local reg_len=${#reg_str}
-    case "$status" in
-        yes)
-            if [[ "$LANG_CODE" == "en" ]]; then
-                colored="${C_GREEN}${C_BOLD}Unlocked${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
-                vis_len=$((8 + reg_len))
-            else
-                colored="${C_GREEN}${C_BOLD}解锁${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
-                vis_len=$((4 + reg_len))
-            fi
-            ;;
-        originals)
-            if [[ "$LANG_CODE" == "en" ]]; then
-                colored="${C_YELLOW}${C_BOLD}Originals${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
-                vis_len=$((9 + reg_len))
-            else
-                colored="${C_YELLOW}${C_BOLD}仅自制剧${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
-                vis_len=$((8 + reg_len))
-            fi
-            ;;
-        api_only)
-            if [[ "$LANG_CODE" == "en" ]]; then
-                colored="${C_YELLOW}${C_BOLD}API Only${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
-                vis_len=$((8 + reg_len))
-            else
-                colored="${C_YELLOW}${C_BOLD}仅API可用${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
-                vis_len=$((9 + reg_len))
-            fi
-            ;;
-        no_prem)
-            if [[ "$LANG_CODE" == "en" ]]; then
-                colored="${C_YELLOW}${C_BOLD}No Premium${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
-                vis_len=$((10 + reg_len))
-            else
-                colored="${C_YELLOW}${C_BOLD}禁会员${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
-                vis_len=$((6 + reg_len))
-            fi
-            ;;
-        blocked)
-            if [[ "$LANG_CODE" == "en" ]]; then
-                colored="${C_RED}${C_BOLD}Blocked${C_RESET}${C_DIM}${reg_str}${C_RESET}"
-                vis_len=$((7 + reg_len))
-            else
-                colored="${C_RED}${C_BOLD}屏蔽/受限${C_RESET}${C_DIM}${reg_str}${C_RESET}"
-                vis_len=$((9 + reg_len))
-            fi
-            ;;
-        *)
-            if [[ "$LANG_CODE" == "en" ]]; then
-                colored="${C_DIM}Failed${C_RESET}"
-                vis_len=6
-            else
-                colored="${C_DIM}检测失败${C_RESET}"
-                vis_len=8
-            fi
-            ;;
-    esac
+# 8 列定宽流媒体/AI 地区行
+render_media_region_8() {
+    local status="$1"
+    local cc="$2"
+    if [[ "$status" == "failed" || "$status" == "no_ipv6" || -z "$cc" || "$cc" == "N/A" ]]; then
+        printf "        "
+    elif [[ ${#cc} -eq 2 ]]; then
+        printf "  ${C_GREEN}[%s]${C_RESET}  " "$cc"
+    elif [[ ${#cc} -eq 3 ]]; then
+        printf " ${C_GREEN}[%s]${C_RESET}  " "$cc"
+    else
+        printf "        "
+    fi
+}
 
-    local pad=$((target_width - vis_len))
-    (( pad < 1 )) && pad=1
-    local spaces=""
-    spaces=$(printf '%*s' "$pad" "")
-    printf "%b%s" "$colored" "$spaces"
+# 经典红/绿邮局连通性块标签（+Gmail / -Outlook）
+render_mail_badges() {
+    local ok_csv="$1"
+    local fail_csv="$2"
+    local providers=("Gmail" "Outlook" "Yahoo" "Apple" "QQ" "163")
+    local p out=""
+    for p in "${providers[@]}"; do
+        if [[ ",${ok_csv}," == *",${p},"* ]]; then
+            out+="${C_GREEN}+${C_RESET}${BG_GREEN}${C_WHITE}${C_BOLD}${p}${C_RESET} "
+        elif [[ ",${fail_csv}," == *",${p},"* ]]; then
+            out+="${C_RED}-${C_RESET}${BG_RED}${C_WHITE}${C_BOLD}${p}${C_RESET} "
+        fi
+    done
+    printf "%b" "$out"
+}
+
+# 72 列居中标题输出辅助（自动计算中英文显示宽度）
+print_centered_72() {
+    local plain_text="$1"
+    local formatted_text="$2"
+    local vis_len
+    vis_len=$(printf '%s' "$plain_text" | LC_ALL=C awk '{
+        w = 0
+        n = length($0)
+        for (i = 1; i <= n; i++) {
+            c = substr($0, i, 1)
+            if (c ~ /[\000-\177]/) w += 1
+            else { w += 2; i += 2 }
+        }
+        print w
+    }' 2>/dev/null || echo "${#plain_text}")
+    local pad=$(( (72 - vis_len) / 2 ))
+    (( pad < 0 )) && pad=0
+    printf '%*s%b\n' "$pad" '' "$formatted_text"
 }
 
 # ==============================================================================
@@ -2159,145 +2249,232 @@ run_single_ip_check() {
             dnsbl: {method: $d_mode, total: $d_tot, clean: $d_cln, blacklisted: $d_hit, hits: $d_names}
         }')
 
-    # ---------------- 构建终端彩色报告 ----------------
+    # ---------------- 构建经典 72 列终端彩色报告 ----------------
+    local t_ipquery_use="unknown" t_ipapi_use="unknown"
+    if [[ "$mob_iq" == "true" ]]; then
+        t_ipquery_use="mobile"
+    elif [[ "$vpn_iq" == "true" ]]; then
+        t_ipquery_use="vpn"
+    elif [[ "$px_iq" == "true" ]]; then
+        t_ipquery_use="proxy"
+    elif [[ "$srv_iq" == "true" ]]; then
+        t_ipquery_use="hosting"
+    elif [[ "$srv_iq" == "false" ]]; then
+        t_ipquery_use="isp"
+    fi
+
+    if [[ "$mob_ia" == "true" ]]; then
+        t_ipapi_use="mobile"
+    elif [[ "$px_ia" == "true" ]]; then
+        t_ipapi_use="proxy"
+    elif [[ "$srv_ia" == "true" ]]; then
+        t_ipapi_use="hosting"
+    elif [[ "$srv_ia" == "false" ]]; then
+        t_ipapi_use="isp"
+    fi
+
     local report_ansi_file="${run_dir}/report.ansi"
     {
-        local sep="========================================================================"
-        local dash="------------------------------------------------------------------------"
-        echo -e "${C_CYAN}${C_BOLD}${sep}${C_RESET}"
+        local hash_line="########################################################################"
+        local eq_line="========================================================================"
+        local repo_url="https://github.com/imthnio/IPzhiliang"
+        local one_liner="bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/run.sh)"
+
+        echo -e "${hash_line}"
         if [[ "$LANG_CODE" == "en" ]]; then
-            echo -e "  ${C_BOLD}IPzhiliang IP Quality Report (IPv${stack})${C_RESET}   Target: ${C_CYAN}${C_BOLD}${display_ip}${C_RESET}"
-            echo -e "  ${C_DIM}Time: ${now_time}  |  v${VERSION}  |  Standalone · Local Zero-Upload${C_RESET}"
+            print_centered_72 "IP QUALITY CHECK REPORT: ${display_ip}" "${C_BOLD}IP QUALITY CHECK REPORT: ${C_CYAN}${display_ip}${C_RESET}"
+            print_centered_72 "${repo_url}" "${C_UNDERLINE}${repo_url}${C_RESET}"
+            print_centered_72 "Report Time: ${now_time}  Version: v${VERSION}" "Report Time: ${now_time}  Version: v${VERSION}"
         else
-            echo -e "  ${C_BOLD}IPzhiliang IP 质量体检报告 (IPv${stack})${C_RESET}      目标 IP: ${C_CYAN}${C_BOLD}${display_ip}${C_RESET}"
-            echo -e "  ${C_DIM}报告时间: ${now_time}  |  v${VERSION}  |  独立引擎 · 纯本地零上传${C_RESET}"
+            print_centered_72 "IP质量体检报告：${display_ip}" "${C_BOLD}IP质量体检报告：${C_CYAN}${display_ip}${C_RESET}"
+            print_centered_72 "${repo_url}" "${C_UNDERLINE}${repo_url}${C_RESET}"
+            print_centered_72 "报告时间：${now_time}  脚本版本：v${VERSION}  纯本地零上传" "报告时间：${now_time}  脚本版本：v${VERSION}  纯本地零上传"
         fi
         if [[ -n "$ACTIVE_PROXY_DISPLAY" ]]; then
-            echo -e "  ${C_DIM}检测通道: 代理 ${ACTIVE_PROXY_DISPLAY}${C_RESET}"
+            print_centered_72 "Proxy: ${ACTIVE_PROXY_DISPLAY}" "${C_DIM}Proxy: ${ACTIVE_PROXY_DISPLAY}${C_RESET}"
         elif [[ -n "$ACTIVE_IFACE" ]]; then
-            echo -e "  ${C_DIM}检测通道: 出口 $(format_iface_display "$ACTIVE_IFACE")${C_RESET}"
+            local iface_disp
+            iface_disp=$(format_iface_display "$ACTIVE_IFACE")
+            print_centered_72 "Interface: ${iface_disp}" "${C_DIM}Interface: ${iface_disp}${C_RESET}"
         fi
-        echo -e "${C_CYAN}${C_BOLD}${sep}${C_RESET}"
+        echo -e "${hash_line}"
 
         # 一、基础信息
-        if [[ "$LANG_CODE" == "en" ]]; then
-            echo -e "${C_BOLD}${C_BLUE}[1] Basic Information${C_RESET}"
-            printf "  %-20s %b\n" "ASN:" "${C_GREEN}${asn:-N/A}${C_RESET}"
-            printf "  %-20s %b\n" "Organization:" "${C_GREEN}${org:-N/A}${C_RESET}"
-            [[ -n "$rdns" ]] && printf "  %-20s %b\n" "rDNS Hostname:" "${C_CYAN}${rdns}${C_RESET}"
-            printf "  %-20s %b\n" "Actual Region:" "${C_GREEN}[${country_code:-N/A}] ${country_name:-N/A}${C_RESET}"
-            [[ -n "$city_name" || -n "$region_name" ]] && printf "  %-20s %b\n" "Location:" "${C_GREEN}${region_name:+${region_name}, }${city_name}${C_RESET}"
-            [[ -n "$reg_country" ]] && printf "  %-20s %b\n" "Registered Region:" "${C_GREEN}[${reg_country}]${C_RESET}"
-            [[ -n "$geo_type_label" ]] && printf "  %-20s %b\n" "IP Origin Type:" "${geo_type_label}"
-            printf "  %-20s %b\n" "Time Zone:" "${C_GREEN}${timezone:-N/A}${C_RESET}"
-            [[ "$is_anycast" == "true" ]] && printf "  %-20s %b\n" "Network Flag:" "${C_YELLOW}Anycast${C_RESET}"
-        else
-            echo -e "${C_BOLD}${C_BLUE}一、基础信息（多源融合校验）${C_RESET}"
-            echo -e "  ${C_CYAN}自治系统号 (ASN):${C_RESET}   ${C_GREEN}${asn:-N/A}${C_RESET}"
-            echo -e "  ${C_CYAN}所属组织 / 运营商:${C_RESET}  ${C_GREEN}${org:-N/A}${C_RESET}"
-            [[ -n "$rdns" ]] && echo -e "  ${C_CYAN}反向解析 (rDNS):${C_RESET}    ${C_CYAN}${rdns}${C_RESET}"
-            echo -e "  ${C_CYAN}实际使用地区:${C_RESET}       ${C_GREEN}[${country_code:-N/A}] ${country_name:-N/A}${C_RESET}"
-            [[ -n "$city_name" || -n "$region_name" ]] && echo -e "  ${C_CYAN}省州 / 城市:${C_RESET}        ${C_GREEN}${region_name:+${region_name}, }${city_name}${C_RESET}"
-            [[ -n "$reg_country" ]] && echo -e "  ${C_CYAN}注册归属地区:${C_RESET}       ${C_GREEN}[${reg_country}]${C_RESET}"
-            [[ -n "$geo_type_label" ]] && echo -e "  ${C_CYAN}IP 归属性质:${C_RESET}        ${geo_type_label}"
-            echo -e "  ${C_CYAN}所在时区:${C_RESET}           ${C_GREEN}${timezone:-N/A}${C_RESET}"
-            [[ "$is_anycast" == "true" ]] && echo -e "  ${C_CYAN}网络广播特性:${C_RESET}       ${C_YELLOW}Anycast (任播网络)${C_RESET}"
+        local city_disp=""
+        if [[ -n "$region_name" && -n "$city_name" && "$region_name" != "$city_name" ]]; then
+            city_disp="${region_name}, ${city_name}"
+        elif [[ -n "$city_name" ]]; then
+            city_disp="$city_name"
+        elif [[ -n "$region_name" ]]; then
+            city_disp="$region_name"
         fi
-        echo -e "${C_DIM}${dash}${C_RESET}"
 
-        # 二、IP 类型与风控评分
         if [[ "$LANG_CODE" == "en" ]]; then
-            echo -e "${C_BOLD}${C_BLUE}[2] IP Type & Risk Scores${C_RESET}"
-            echo -e "  Usage Type (IPinfo):    $(render_type_badge "$t_ipinfo_use")   Company: $(render_type_badge "$t_ipinfo_com")"
-            echo -e "  Type (ProxyCheck):      $(render_type_badge "$t_pcheck")"
-            echo -e "  ${C_BOLD}Composite Score:${C_RESET}        $(render_risk_bar "$avg_score")"
+            echo -e "1. Basic Information (${C_ITALIC}Multi-Source Consensus${C_RESET})"
+            echo -e "${C_CYAN}ASN:                    ${C_GREEN}${asn:-N/A}${C_RESET}"
+            echo -e "${C_CYAN}Organization:           ${C_GREEN}${org:-N/A}${C_RESET}"
+            [[ -n "$rdns" ]] && echo -e "${C_CYAN}rDNS:                   ${C_GREEN}${rdns}${C_RESET}"
+            [[ -n "$city_disp" ]] && echo -e "${C_CYAN}City:                   ${C_GREEN}${city_disp}${C_RESET}"
+            echo -e "${C_CYAN}Actual Region:          ${C_GREEN}[${country_code:-N/A}] ${country_name:-N/A}${C_RESET}"
+            [[ -n "$reg_country" ]] && echo -e "${C_CYAN}Registered Region:      ${C_GREEN}[${reg_country}]${C_RESET}"
+            echo -e "${C_CYAN}Time Zone:              ${C_GREEN}${timezone:-N/A}${C_RESET}"
+            if [[ -n "$country_code" && -n "$reg_country" ]]; then
+                if [[ "$country_code" == "$reg_country" ]]; then
+                    echo -e "${C_CYAN}IP Type:                ${BG_GREEN}${C_WHITE}${C_BOLD} Geo-consistent ${C_RESET}"
+                else
+                    echo -e "${C_CYAN}IP Type:                ${BG_RED}${C_WHITE}${C_BOLD} Geo-discrepant ${C_RESET}"
+                fi
+            fi
+            [[ "$is_anycast" == "true" ]] && echo -e "${C_CYAN}Routing:                ${C_YELLOW}Anycast${C_RESET}"
         else
-            echo -e "${C_BOLD}${C_BLUE}二、IP 类型与多库风控评分${C_RESET}"
-            echo -e "  ${C_CYAN}IPinfo 使用类型:${C_RESET}    $(render_type_badge "$t_ipinfo_use")   ${C_CYAN}公司类型:${C_RESET} $(render_type_badge "$t_ipinfo_com")"
-            echo -e "  ${C_CYAN}ProxyCheck 分类:${C_RESET}    $(render_type_badge "$t_pcheck")"
-            echo -e "  ${C_CYAN}${C_BOLD}综合风控评级:${C_RESET}       $(render_risk_bar "$avg_score")"
+            echo -e "一、基础信息（${C_ITALIC}多源融合数据库${C_RESET}）"
+            echo -e "${C_CYAN}自治系统号：            ${C_GREEN}${asn:-未分配}${C_RESET}"
+            echo -e "${C_CYAN}组织：                  ${C_GREEN}${org:-N/A}${C_RESET}"
+            [[ -n "$rdns" ]] && echo -e "${C_CYAN}反向解析：              ${C_GREEN}${rdns}${C_RESET}"
+            [[ -n "$city_disp" ]] && echo -e "${C_CYAN}城市：                  ${C_GREEN}${city_disp}${C_RESET}"
+            echo -e "${C_CYAN}使用地：                ${C_GREEN}[${country_code:-N/A}] ${country_name:-N/A}${C_RESET}"
+            [[ -n "$reg_country" ]] && echo -e "${C_CYAN}注册地：                ${C_GREEN}[${reg_country}]${C_RESET}"
+            echo -e "${C_CYAN}时区：                  ${C_GREEN}${timezone:-N/A}${C_RESET}"
+            if [[ -n "$country_code" && -n "$reg_country" ]]; then
+                if [[ "$country_code" == "$reg_country" ]]; then
+                    echo -e "${C_CYAN}IP类型：                ${BG_GREEN}${C_WHITE}${C_BOLD} 原生IP ${C_RESET}"
+                else
+                    echo -e "${C_CYAN}IP类型：                ${BG_RED}${C_WHITE}${C_BOLD} 广播IP ${C_RESET}"
+                fi
+            fi
+            [[ "$is_anycast" == "true" ]] && echo -e "${C_CYAN}网络属性：              ${C_YELLOW}Anycast (任播网络)${C_RESET}"
         fi
-        [[ "$s_scam" =~ ^[0-9]+$ ]]    && printf "    %-18s %b\n" "Scamalytics:" "$(render_risk_bar "$s_scam")"
-        [[ "$s_pcheck" =~ ^[0-9]+$ ]]  && printf "    %-18s %b\n" "ProxyCheck:" "$(render_risk_bar "$s_pcheck")"
-        [[ "$s_ipquery" =~ ^[0-9]+$ ]] && printf "    %-18s %b\n" "IPQuery:" "$(render_risk_bar "$s_ipquery")"
-        [[ "$s_abuse" =~ ^[0-9]+$ ]]   && printf "    %-18s %b\n" "AbuseIPDB(Key):" "$(render_risk_bar "$s_abuse")"
-        [[ "$s_ipqs" =~ ^[0-9]+$ ]]    && printf "    %-18s %b\n" "IPQS(Key):" "$(render_risk_bar "$s_ipqs")"
-        echo -e "${C_DIM}${dash}${C_RESET}"
 
-        # 三、风险因子矩阵（定宽 9 列精确对齐）
+        # 二、IP类型属性
         if [[ "$LANG_CODE" == "en" ]]; then
-            echo -e "${C_BOLD}${C_BLUE}[3] Risk Factors Cross-Check${C_RESET}"
-            printf "  ${C_CYAN}%-10s${C_RESET}%-9s%-9s%-9s%-9s%-9s%-9s\n" "Factor" "IPinfo" "IPQuery" "ProxyChk" "Scamalyt" "IP-API" "IP2Loc"
-            printf "  %-10s${C_GREEN}%-9s%-9s%-9s%-9s%-9s%-9s${C_RESET}\n" "Region" "$cc_ii" "$cc_iq" "$cc_pc" "$cc_sc" "$cc_ia" "$cc_i2"
-            printf "  %-10s%b%b%b%b%b%b\n" "Proxy"  "$(render_bool_cell "$px_ii")"  "$(render_bool_cell "$px_iq")"  "$(render_bool_cell "$px_pc")"  "$(render_bool_cell "$px_sc")"  "$(render_bool_cell "$px_ia")"  "$(render_bool_cell "$px_i2")"
-            printf "  %-10s%b%b%b%b%b%b\n" "VPN"    "$(render_bool_cell "$vpn_ii")" "$(render_bool_cell "$vpn_iq")" "$(render_bool_cell "$vpn_pc")" "$(render_bool_cell "$vpn_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
-            printf "  %-10s%b%b%b%b%b%b\n" "Tor"    "$(render_bool_cell "$tor_ii")" "$(render_bool_cell "$tor_iq")" "$(render_bool_cell "null")"    "$(render_bool_cell "$tor_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
-            printf "  %-10s%b%b%b%b%b%b\n" "Server" "$(render_bool_cell "$srv_ii")" "$(render_bool_cell "$srv_iq")" "$(render_bool_cell "$srv_pc")" "$(render_bool_cell "$srv_sc")" "$(render_bool_cell "$srv_ia")" "$(render_bool_cell "null")"
-            printf "  %-10s%b%b%b%b%b%b\n" "Mobile" "$(render_bool_cell "$mob_ii")" "$(render_bool_cell "$mob_iq")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "$mob_ia")" "$(render_bool_cell "null")"
-            printf "  %-10s%b%b%b%b%b%b\n" "Robot"  "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "$rob_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
+            echo -e "2. IP Type"
+            echo -e "${C_CYAN}Database:   ${C_RESET}${C_ITALIC}  IPinfo     ProxyCheck   IPQuery     IP-API  ${C_RESET}"
+            printf "${C_CYAN}Usage:      ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_use")" "$(render_type_cell "$t_pcheck")" "$(render_type_cell "$t_ipquery_use")" "$(render_type_cell "$t_ipapi_use")"
+            printf "${C_CYAN}Company:    ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_com")" "$(render_type_cell "")" "$(render_type_cell "")" "$(render_type_cell "")"
         else
-            echo -e "${C_BOLD}${C_BLUE}三、六源风险因子交叉矩阵${C_RESET}"
-            printf "  ${C_CYAN}风控项    ${C_RESET}%-9s%-9s%-9s%-9s%-9s%-9s\n" "IPinfo" "IPQuery" "ProxyChk" "Scamalyt" "IP-API" "IP2Loc"
-            printf "  地区码    ${C_GREEN}%-9s%-9s%-9s%-9s%-9s%-9s${C_RESET}\n" "$cc_ii" "$cc_iq" "$cc_pc" "$cc_sc" "$cc_ia" "$cc_i2"
-            printf "  代理      %b%b%b%b%b%b\n" "$(render_bool_cell "$px_ii")"  "$(render_bool_cell "$px_iq")"  "$(render_bool_cell "$px_pc")"  "$(render_bool_cell "$px_sc")"  "$(render_bool_cell "$px_ia")"  "$(render_bool_cell "$px_i2")"
-            printf "  VPN       %b%b%b%b%b%b\n" "$(render_bool_cell "$vpn_ii")" "$(render_bool_cell "$vpn_iq")" "$(render_bool_cell "$vpn_pc")" "$(render_bool_cell "$vpn_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
-            printf "  Tor       %b%b%b%b%b%b\n" "$(render_bool_cell "$tor_ii")" "$(render_bool_cell "$tor_iq")" "$(render_bool_cell "null")"    "$(render_bool_cell "$tor_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
-            printf "  机房      %b%b%b%b%b%b\n" "$(render_bool_cell "$srv_ii")" "$(render_bool_cell "$srv_iq")" "$(render_bool_cell "$srv_pc")" "$(render_bool_cell "$srv_sc")" "$(render_bool_cell "$srv_ia")" "$(render_bool_cell "null")"
-            printf "  移动      %b%b%b%b%b%b\n" "$(render_bool_cell "$mob_ii")" "$(render_bool_cell "$mob_iq")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "$mob_ia")" "$(render_bool_cell "null")"
-            printf "  爬虫      %b%b%b%b%b%b\n" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "$rob_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
+            echo -e "二、IP类型属性"
+            echo -e "${C_CYAN}数据库：    ${C_RESET}${C_ITALIC}  IPinfo     ProxyCheck   IPQuery     IP-API  ${C_RESET}"
+            printf "${C_CYAN}使用类型：  ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_use")" "$(render_type_cell "$t_pcheck")" "$(render_type_cell "$t_ipquery_use")" "$(render_type_cell "$t_ipapi_use")"
+            printf "${C_CYAN}公司类型：  ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_com")" "$(render_type_cell "")" "$(render_type_cell "")" "$(render_type_cell "")"
         fi
-        echo -e "${C_DIM}${dash}${C_RESET}"
 
-        # 四、AI 与流媒体解锁
+        # 三、风险评分（经典三色渐变热力条）
+        if [[ "$LANG_CODE" == "en" ]]; then
+            echo -e "3. Risk Score"
+            echo -e "${C_CYAN}Levels:         ${C_ITALIC}${C_WHITE}${BG_GREEN}VeryLow     Low ${BG_YELLOW}     Medium     ${BG_RED} High   VeryHigh${C_RESET}"
+            [[ "$s_scam" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}Scamalytics:    ${C_RESET}%b\n" "$(render_risk_bar "$s_scam")"
+            [[ "$s_pcheck" =~ ^[0-9]+$ ]]  && printf "${C_CYAN}ProxyCheck:     ${C_RESET}%b\n" "$(render_risk_bar "$s_pcheck")"
+            [[ "$s_ipquery" =~ ^[0-9]+$ ]] && printf "${C_CYAN}IPQuery:        ${C_RESET}%b\n" "$(render_risk_bar "$s_ipquery")"
+            [[ "$s_abuse" =~ ^[0-9]+$ ]]   && printf "${C_CYAN}AbuseIPDB:      ${C_RESET}%b\n" "$(render_risk_bar "$s_abuse")"
+            [[ "$s_ipqs" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}IPQS:           ${C_RESET}%b\n" "$(render_risk_bar "$s_ipqs")"
+            printf "${C_CYAN}${C_BOLD}Composite:      ${C_RESET}%b\n" "$(render_risk_bar "$avg_score")"
+        else
+            echo -e "三、风险评分"
+            echo -e "${C_CYAN}风险等级：      ${C_ITALIC}${C_WHITE}${BG_GREEN}极低         低 ${BG_YELLOW}      中等      ${BG_RED} 高         极高${C_RESET}"
+            [[ "$s_scam" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}Scamalytics：   ${C_RESET}%b\n" "$(render_risk_bar "$s_scam")"
+            [[ "$s_pcheck" =~ ^[0-9]+$ ]]  && printf "${C_CYAN}ProxyCheck：    ${C_RESET}%b\n" "$(render_risk_bar "$s_pcheck")"
+            [[ "$s_ipquery" =~ ^[0-9]+$ ]] && printf "${C_CYAN}IPQuery：       ${C_RESET}%b\n" "$(render_risk_bar "$s_ipquery")"
+            [[ "$s_abuse" =~ ^[0-9]+$ ]]   && printf "${C_CYAN}AbuseIPDB：     ${C_RESET}%b\n" "$(render_risk_bar "$s_abuse")"
+            [[ "$s_ipqs" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}IPQS：          ${C_RESET}%b\n" "$(render_risk_bar "$s_ipqs")"
+            printf "${C_CYAN}${C_BOLD}综合评级：      ${C_RESET}%b\n" "$(render_risk_bar "$avg_score")"
+        fi
+
+        # 四、风险因子
+        if [[ "$LANG_CODE" == "en" ]]; then
+            echo -e "4. Risk Factors"
+            echo -e "${C_CYAN}DB:      ${C_RESET}${C_ITALIC}  IPinfo    IPQuery   ProxyChk  Scamalyt   IP-API    IP2Loc ${C_RESET}"
+            printf "${C_CYAN}Region:  ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_cc "$cc_ii")" "$(render_factor_cc "$cc_iq")" "$(render_factor_cc "$cc_pc")" "$(render_factor_cc "$cc_sc")" "$(render_factor_cc "$cc_ia")" "$(render_factor_cc "$cc_i2")"
+            printf "${C_CYAN}Proxy:   ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$px_ii")" "$(render_factor_bool "$px_iq")" "$(render_factor_bool "$px_pc")" "$(render_factor_bool "$px_sc")" "$(render_factor_bool "$px_ia")" "$(render_factor_bool "$px_i2")"
+            printf "${C_CYAN}VPN:     ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$vpn_ii")" "$(render_factor_bool "$vpn_iq")" "$(render_factor_bool "$vpn_pc")" "$(render_factor_bool "$vpn_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}Tor:     ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$tor_ii")" "$(render_factor_bool "$tor_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "$tor_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}Server:  ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$srv_ii")" "$(render_factor_bool "$srv_iq")" "$(render_factor_bool "$srv_pc")" "$(render_factor_bool "$srv_sc")" "$(render_factor_bool "$srv_ia")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}Mobile:  ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$mob_ii")" "$(render_factor_bool "$mob_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$mob_ia")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}Robot:   ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$rob_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+        else
+            echo -e "四、风险因子"
+            echo -e "${C_CYAN}库：     ${C_RESET}${C_ITALIC}  IPinfo    IPQuery   ProxyChk  Scamalyt   IP-API    IP2Loc ${C_RESET}"
+            printf "${C_CYAN}地区：   ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_cc "$cc_ii")" "$(render_factor_cc "$cc_iq")" "$(render_factor_cc "$cc_pc")" "$(render_factor_cc "$cc_sc")" "$(render_factor_cc "$cc_ia")" "$(render_factor_cc "$cc_i2")"
+            printf "${C_CYAN}代理：   ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$px_ii")" "$(render_factor_bool "$px_iq")" "$(render_factor_bool "$px_pc")" "$(render_factor_bool "$px_sc")" "$(render_factor_bool "$px_ia")" "$(render_factor_bool "$px_i2")"
+            printf "${C_CYAN}VPN：    ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$vpn_ii")" "$(render_factor_bool "$vpn_iq")" "$(render_factor_bool "$vpn_pc")" "$(render_factor_bool "$vpn_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}Tor：    ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$tor_ii")" "$(render_factor_bool "$tor_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "$tor_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}服务器： ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$srv_ii")" "$(render_factor_bool "$srv_iq")" "$(render_factor_bool "$srv_pc")" "$(render_factor_bool "$srv_sc")" "$(render_factor_bool "$srv_ia")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}移动：   ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$mob_ii")" "$(render_factor_bool "$mob_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$mob_ia")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}机器人： ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$rob_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+        fi
+
+        # 五、流媒体及AI服务解锁检测（经典 8 列横向色块矩阵）
         if [[ "$SKIP_MEDIA" -eq 0 ]]; then
             if [[ "$LANG_CODE" == "en" ]]; then
-                echo -e "${C_BOLD}${C_BLUE}[4] AI & Streaming Unlock${C_RESET}"
+                echo -e "5. Accessibility Check for AI and Streaming Services"
+                echo -e "${C_CYAN}Service:${C_RESET}${C_ITALIC}ChatGPT Claude  Gemini  Netflix Disney+ YouTube TikTok  PrimeV  Reddit  ${C_RESET}"
+                printf "${C_CYAN}Status: ${C_RESET}%b%b%b%b%b%b%b%b%b\n" \
+                    "$(render_media_badge_8 "$m_chatgpt_s")" "$(render_media_badge_8 "$m_claude_s")" "$(render_media_badge_8 "$m_gemini_s")" \
+                    "$(render_media_badge_8 "$m_netflix_s")" "$(render_media_badge_8 "$m_disney_s")" "$(render_media_badge_8 "$m_youtube_s")" \
+                    "$(render_media_badge_8 "$m_tiktok_s")" "$(render_media_badge_8 "$m_prime_s")" "$(render_media_badge_8 "$m_reddit_s")"
+                printf "${C_CYAN}Region: ${C_RESET}%b%b%b%b%b%b%b%b%b\n" \
+                    "$(render_media_region_8 "$m_chatgpt_s" "$m_chatgpt_r")" "$(render_media_region_8 "$m_claude_s" "$m_claude_r")" "$(render_media_region_8 "$m_gemini_s" "$m_gemini_r")" \
+                    "$(render_media_region_8 "$m_netflix_s" "$m_netflix_r")" "$(render_media_region_8 "$m_disney_s" "$m_disney_r")" "$(render_media_region_8 "$m_youtube_s" "$m_youtube_r")" \
+                    "$(render_media_region_8 "$m_tiktok_s" "$m_tiktok_r")" "$(render_media_region_8 "$m_prime_s" "$m_prime_r")" "$(render_media_region_8 "$m_reddit_s" "$m_reddit_r")"
             else
-                echo -e "${C_BOLD}${C_BLUE}四、AI 与流媒体解锁检测${C_RESET}"
+                echo -e "五、流媒体及AI服务解锁检测"
+                echo -e "${C_CYAN}服务：  ${C_RESET}${C_ITALIC}ChatGPT Claude  Gemini  Netflix Disney+ YouTube TikTok  PrimeV  Reddit  ${C_RESET}"
+                printf "${C_CYAN}状态：  ${C_RESET}%b%b%b%b%b%b%b%b%b\n" \
+                    "$(render_media_badge_8 "$m_chatgpt_s")" "$(render_media_badge_8 "$m_claude_s")" "$(render_media_badge_8 "$m_gemini_s")" \
+                    "$(render_media_badge_8 "$m_netflix_s")" "$(render_media_badge_8 "$m_disney_s")" "$(render_media_badge_8 "$m_youtube_s")" \
+                    "$(render_media_badge_8 "$m_tiktok_s")" "$(render_media_badge_8 "$m_prime_s")" "$(render_media_badge_8 "$m_reddit_s")"
+                printf "${C_CYAN}地区：  ${C_RESET}%b%b%b%b%b%b%b%b%b\n" \
+                    "$(render_media_region_8 "$m_chatgpt_s" "$m_chatgpt_r")" "$(render_media_region_8 "$m_claude_s" "$m_claude_r")" "$(render_media_region_8 "$m_gemini_s" "$m_gemini_r")" \
+                    "$(render_media_region_8 "$m_netflix_s" "$m_netflix_r")" "$(render_media_region_8 "$m_disney_s" "$m_disney_r")" "$(render_media_region_8 "$m_youtube_s" "$m_youtube_r")" \
+                    "$(render_media_region_8 "$m_tiktok_s" "$m_tiktok_r")" "$(render_media_region_8 "$m_prime_s" "$m_prime_r")" "$(render_media_region_8 "$m_reddit_s" "$m_reddit_r")"
             fi
-            printf "  ${C_CYAN}%-13s${C_RESET}%b${C_CYAN}%-13s${C_RESET}%b\n" "ChatGPT:" "$(render_media_cell "$m_chatgpt_s" "$m_chatgpt_r" 24)" "Claude:"     "$(render_media_cell "$m_claude_s" "$m_claude_r" 1)"
-            printf "  ${C_CYAN}%-13s${C_RESET}%b${C_CYAN}%-13s${C_RESET}%b\n" "Gemini:"  "$(render_media_cell "$m_gemini_s" "$m_gemini_r" 24)"   "Netflix:"    "$(render_media_cell "$m_netflix_s" "$m_netflix_r" 1)"
-            printf "  ${C_CYAN}%-13s${C_RESET}%b${C_CYAN}%-13s${C_RESET}%b\n" "Disney+:" "$(render_media_cell "$m_disney_s" "$m_disney_r" 24)"   "YouTube:"    "$(render_media_cell "$m_youtube_s" "$m_youtube_r" 1)"
-            printf "  ${C_CYAN}%-13s${C_RESET}%b${C_CYAN}%-13s${C_RESET}%b\n" "TikTok:"  "$(render_media_cell "$m_tiktok_s" "$m_tiktok_r" 24)"   "PrimeVideo:" "$(render_media_cell "$m_prime_s" "$m_prime_r" 1)"
-            printf "  ${C_CYAN}%-13s${C_RESET}%b\n"                           "Reddit:"  "$(render_media_cell "$m_reddit_s" "$m_reddit_r" 1)"
-            echo -e "${C_DIM}${dash}${C_RESET}"
         fi
 
-        # 五、邮局 25 端口与 DNSBL 黑名单
+        # 六、邮局连通性及黑名单检测
+        local mail_badges=""
+        [[ -n "$mail_ok_list" || -n "$mail_fail_list" ]] && mail_badges=$(render_mail_badges "$mail_ok_list" "$mail_fail_list")
         if [[ "$LANG_CODE" == "en" ]]; then
-            echo -e "${C_BOLD}${C_BLUE}[5] Mail Port 25 & DNSBL Blacklist${C_RESET}"
+            echo -e "6. Email Service Availability and Blacklist Detection"
             case "$mail_local" in
-                available)  echo -e "  Port 25 Outbound: ${C_GREEN}${C_BOLD}Available${C_RESET} ${mail_ok_list:+(Reachable: ${mail_ok_list})}" ;;
-                occupied)   echo -e "  Port 25 Outbound: ${C_YELLOW}Local Port 25 Occupied${C_RESET} ${mail_ok_list:+(Reachable: ${mail_ok_list})}" ;;
-                proxy_skip) echo -e "  Port 25 Outbound: ${C_DIM}Skipped in proxy mode (prevents direct host IP leak)${C_RESET}" ;;
-                user_skip)  echo -e "  Port 25 Outbound: ${C_DIM}Skipped (--no-mail)${C_RESET}" ;;
-                no_nc)      echo -e "  Port 25 Outbound: ${C_DIM}Skipped (nc not installed)${C_RESET}" ;;
-                *)          echo -e "  Port 25 Outbound: ${C_RED}Blocked${C_RESET} ${mail_ok_list:+(Remote reachable: ${mail_ok_list})}" ;;
+                available)  echo -e "${C_CYAN}Local Port 25 Outbound: ${C_GREEN}Available${C_RESET}" ;;
+                occupied)   echo -e "${C_CYAN}Local Port 25 Outbound: ${C_YELLOW}Occupied${C_RESET}" ;;
+                proxy_skip) echo -e "${C_CYAN}Local Port 25 Outbound: ${C_DIM}Skipped in proxy mode (prevents direct IP leak)${C_RESET}" ;;
+                user_skip)  echo -e "${C_CYAN}Local Port 25 Outbound: ${C_DIM}Skipped (--no-mail)${C_RESET}" ;;
+                no_nc)      echo -e "${C_CYAN}Local Port 25 Outbound: ${C_DIM}Skipped (nc not installed)${C_RESET}" ;;
+                *)          echo -e "${C_CYAN}Local Port 25 Outbound: ${C_RED}Blocked${C_RESET}" ;;
             esac
-            if [[ "$stack" == "4" ]]; then
-                echo -e "  DNSBL (${dnsbl_mode}):     Total ${C_CYAN}${dnsbl_total}${C_RESET}  |  Clean ${C_GREEN}${dnsbl_clean}${C_RESET}  |  Blacklisted $([[ $dnsbl_hits -gt 0 ]] && echo -e "${C_RED}${C_BOLD}${dnsbl_hits}${C_RESET}" || echo -e "${C_GREEN}0${C_RESET}")"
-                [[ -n "$dnsbl_hit_names" ]] && echo -e "  ${C_RED}Blacklisted By:${C_RESET}   ${dnsbl_hit_names}"
-            else
-                echo -e "  DNSBL Blacklist:  ${C_DIM}IPv4 only (skipped for IPv6)${C_RESET}"
+            if [[ -n "$mail_badges" ]]; then
+                echo -e "${C_CYAN}Conn: ${C_RESET}${mail_badges}"
             fi
+            if [[ "$stack" == "4" ]]; then
+                echo -e "${C_CYAN}DNSBL database (${dnsbl_mode}):  ${C_CYAN}Active ${C_BOLD}${dnsbl_total}${C_RESET}   ${C_GREEN}Clean ${C_BOLD}${dnsbl_clean}${C_RESET}   ${C_RED}Blacklisted ${C_BOLD}${dnsbl_hits}${C_RESET}"
+                [[ -n "$dnsbl_hit_names" ]] && echo -e "${C_RED}${C_BOLD}Blacklisted By: ${C_RESET}${dnsbl_hit_names}"
+            else
+                echo -e "${C_CYAN}DNSBL database: ${C_DIM}IPv4 only (skipped for IPv6)${C_RESET}"
+            fi
+            echo -e "${eq_line}"
+            echo -e "${C_ITALIC}IPzhiliang v${VERSION} · 100% Standalone · Zero-Upload Privacy Mode${C_RESET}"
         else
-            echo -e "${C_BOLD}${C_BLUE}五、邮局 25 端口与 DNSBL 黑名单扫描${C_RESET}"
+            echo -e "六、邮局连通性及黑名单检测"
             case "$mail_local" in
-                available)  echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_GREEN}${C_BOLD}可用${C_RESET} ${mail_ok_list:+(可达邮局: ${mail_ok_list})}" ;;
-                occupied)   echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_YELLOW}已被本地占用${C_RESET} ${mail_ok_list:+(可达邮局: ${mail_ok_list})}" ;;
-                proxy_skip) echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_DIM}代理模式下自动跳过（防止直连绕过代理泄露本机 IP）${C_RESET}" ;;
-                user_skip)  echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_DIM}已跳过 (--no-mail)${C_RESET}" ;;
-                no_nc)      echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_DIM}未检测到 nc，已跳过${C_RESET}" ;;
-                *)          echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_RED}阻断${C_RESET} ${mail_ok_list:+(远端可达: ${mail_ok_list})}" ;;
+                available)  echo -e "${C_CYAN}本地25端口出站：${C_GREEN}可用${C_RESET}" ;;
+                occupied)   echo -e "${C_CYAN}本地25端口出站：${C_YELLOW}占用${C_RESET}" ;;
+                proxy_skip) echo -e "${C_CYAN}本地25端口出站：${C_DIM}代理模式已跳过（防止直连泄露宿主机IP）${C_RESET}" ;;
+                user_skip)  echo -e "${C_CYAN}本地25端口出站：${C_DIM}已跳过 (--no-mail)${C_RESET}" ;;
+                no_nc)      echo -e "${C_CYAN}本地25端口出站：${C_DIM}未安装 nc 已跳过${C_RESET}" ;;
+                *)          echo -e "${C_CYAN}本地25端口出站：${C_RED}阻断${C_RESET}" ;;
             esac
-            if [[ "$stack" == "4" ]]; then
-                echo -e "  ${C_CYAN}DNSBL 黑名单 (${dnsbl_mode}):${C_RESET} 扫描 ${C_CYAN}${dnsbl_total}${C_RESET} 库  |  正常 ${C_GREEN}${dnsbl_clean}${C_RESET}  |  命中黑名单 $([[ $dnsbl_hits -gt 0 ]] && echo -e "${C_RED}${C_BOLD}${dnsbl_hits}${C_RESET}" || echo -e "${C_GREEN}0${C_RESET}")"
-                [[ -n "$dnsbl_hit_names" ]] && echo -e "  ${C_RED}${C_BOLD}命中黑名单列表:${C_RESET}   ${dnsbl_hit_names}"
-            else
-                echo -e "  ${C_CYAN}DNSBL 黑名单:${C_RESET}     ${C_DIM}仅适用于 IPv4（IPv6 自动跳过）${C_RESET}"
+            if [[ -n "$mail_badges" ]]; then
+                echo -e "${C_CYAN}通信：${C_RESET}${mail_badges}"
             fi
+            if [[ "$stack" == "4" ]]; then
+                echo -e "${C_CYAN}IP地址黑名单数据库 (${dnsbl_mode})：  ${C_CYAN}有效 ${C_BOLD}${dnsbl_total}${C_RESET}   ${C_GREEN}正常 ${C_BOLD}${dnsbl_clean}${C_RESET}   ${C_RED}黑名单 ${C_BOLD}${dnsbl_hits}${C_RESET}"
+                [[ -n "$dnsbl_hit_names" ]] && echo -e "${C_RED}${C_BOLD}命中黑名单：${C_RESET}${dnsbl_hit_names}"
+            else
+                echo -e "${C_CYAN}IP地址黑名单数据库：${C_DIM}仅支持 IPv4（IPv6 自动跳过）${C_RESET}"
+            fi
+            echo -e "${eq_line}"
+            echo -e "${C_ITALIC}IPzhiliang v${VERSION} · 独立自研引擎 · 零中转 · 纯本地零上传${C_RESET}"
         fi
-        echo -e "${C_CYAN}${C_BOLD}${sep}${C_RESET}"
         echo ""
     } > "$report_ansi_file"
 
