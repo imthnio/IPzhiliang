@@ -7,8 +7,9 @@
 
 set -u
 
-VERSION="2.2.1"
+VERSION="2.3.0"
 SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
+KEYS_CONFIG_FILE="${XDG_CONFIG_HOME:-${HOME:-/root}/.config}/ipzhiliang/keys.env"
 
 # 颜色定义
 C_RESET="\033[0m"
@@ -502,13 +503,179 @@ IPzhiliang v${VERSION} - 独立开源、隐私优先的 IP 质量与流媒体/AI
   -y                 自动安装缺失依赖 (curl / jq) [默认]
   -n                 跳过依赖自动安装
   --update           将本地 ipzhiliang.sh 更新到 GitHub 最新版本
+  --keys             交互式查看/配置免费扩展数据库 API Key (保存至 ~/.config/ipzhiliang/keys.env, 0600 权限)
   --dry-run          仅预览检测配置，不发起实际网络检测
   -h, --help         显示本帮助信息
 
-可选自有 API Key 扩展（环境变量直连官方，不经任何中转）:
-  ABUSEIPDB_API_KEY  启用 AbuseIPDB 官方风控置信度查询
-  IPQS_API_KEY       启用 IPQualityScore 官方欺诈评分查询
+免 Key 内置直连数据库 (9 大零中转权威源，开箱即用):
+  IPinfo · ipregistry · IP2Location(PX12完整版) · Scamalytics · ProxyCheck · IPQuery · IP-API · DB-IP · StopForumSpam (+ ip.guide)
+
+可选自有免费 API Key 扩展（环境变量或 --keys 本地配置，直连官方零中转）:
+  IPAPI_IS_API_KEY     启用 ipapi.is 完整版 (使用/公司类型 + abuser_score + 风险因子，免费 1,000 次/天)
+  ABUSEIPDB_API_KEY    启用 AbuseIPDB 官方 API (使用类型 + 置信度风险分 + 滥用/Tor，免费 1,000 次/天)
+  IPDATA_API_KEY       启用 ipdata 官方威胁库 (地区/代理/Tor/服务器/滥用，免费 1,500 次/天)
+  IPQS_API_KEY         启用 IPQualityScore 官方库 (欺诈分 + 代理/Tor/VPN/滥用/机器人，免费 5,000 次/月)
+  IP2LOCATION_API_KEY  使用自有 IP2Location.io Key (可选，免 Key 已内置完整 PX12 演示库)
+  IPREGISTRY_API_KEY   使用自有 ipregistry Key (可选，免 Key 已直连可用)
+  DBIP_API_KEY         使用自有 DB-IP Key (可选，免 Key 已直连可用)
+  MAXMIND_ACCOUNT_ID / MAXMIND_LICENSE_KEY  启用 MaxMind GeoLite2/GeoIP2 官方基础地理库 (可选)
 EOF
+}
+
+# ==============================================================================
+# 可选自有 API Key 安全加载与交互配置 (仅读取白名单变量，0600 权限，绝不 source 任意代码)
+# ==============================================================================
+
+mask_api_key() {
+    local k="${1:-}"
+    local len=${#k}
+    if (( len == 0 )); then
+        echo "未配置"
+    elif (( len <= 8 )); then
+        echo "***"
+    else
+        echo "${k:0:4}***${k:len-4:4}"
+    fi
+}
+
+load_saved_keys() {
+    [[ -r "$KEYS_CONFIG_FILE" ]] || return 0
+    local line key val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" != *=* ]] && continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        val="${val#\"}"
+        val="${val%\"}"
+        val="${val#\'}"
+        val="${val%\'}"
+        case "$key" in
+            IPAPI_IS_API_KEY|ABUSEIPDB_API_KEY|IPDATA_API_KEY|IPQS_API_KEY|IP2LOCATION_API_KEY|IPREGISTRY_API_KEY|DBIP_API_KEY|MAXMIND_ACCOUNT_ID|MAXMIND_LICENSE_KEY)
+                if [[ -z "${!key:-}" && -n "$val" ]]; then
+                    printf -v "$key" '%s' "$val"
+                    export "$key"
+                fi
+                ;;
+        esac
+    done < "$KEYS_CONFIG_FILE"
+}
+
+save_keys_config() {
+    local cfg_dir
+    cfg_dir=$(dirname "$KEYS_CONFIG_FILE")
+    local old_umask
+    old_umask=$(umask)
+    umask 077
+    mkdir -p "$cfg_dir" 2>/dev/null || {
+        umask "$old_umask"
+        echo -e "${C_RED}[错误] 无法创建配置目录: ${cfg_dir}${C_RESET}" >&2
+        return 1
+    }
+    chmod 700 "$cfg_dir" 2>/dev/null || true
+    {
+        echo "# IPzhiliang optional API keys (chmod 600, direct official API only)"
+        local k v
+        for k in IPAPI_IS_API_KEY ABUSEIPDB_API_KEY IPDATA_API_KEY IPQS_API_KEY IP2LOCATION_API_KEY IPREGISTRY_API_KEY DBIP_API_KEY MAXMIND_ACCOUNT_ID MAXMIND_LICENSE_KEY; do
+            v="${!k:-}"
+            [[ -n "$v" ]] && printf '%s=%s\n' "$k" "$v"
+        done
+    } > "$KEYS_CONFIG_FILE"
+    chmod 600 "$KEYS_CONFIG_FILE" 2>/dev/null || true
+    umask "$old_umask"
+    echo -e "${C_GREEN}[已保存] API Key 已加密权限写入 ${KEYS_CONFIG_FILE} (0600)${C_RESET}"
+}
+
+has_any_byok_keys() {
+    [[ -n "${IPAPI_IS_API_KEY:-}" || -n "${ABUSEIPDB_API_KEY:-}" || -n "${IPDATA_API_KEY:-}" || -n "${IPQS_API_KEY:-}" || -n "${IP2LOCATION_API_KEY:-}" || -n "${IPREGISTRY_API_KEY:-}" || -n "${DBIP_API_KEY:-}" || ( -n "${MAXMIND_ACCOUNT_ID:-}" && -n "${MAXMIND_LICENSE_KEY:-}" ) ]]
+}
+
+configure_api_keys_interactive() {
+    load_saved_keys
+    echo ""
+    echo -e "${C_BOLD}${C_PURPLE}=== 免费扩展数据库 API Key 管理 (纯本地 0600 保存 · 直连官方零中转) ===${C_RESET}"
+    echo -e "${C_DIM}内置 9 大免 Key 数据库已默认全开：IPinfo / ipregistry / IP2Location(PX12) / Scamalytics / ProxyCheck / IPQuery / IP-API / DB-IP / StopForumSpam${C_RESET}"
+    echo -e "${C_DIM}以下扩展库官方要求自有免费 Key（输入新 Key 更新，输入 clear 清空，直接回车跳过）：${C_RESET}"
+    echo ""
+
+    while true; do
+        echo -e "  ${C_GREEN}1)${C_RESET} ipapi.is         (免费 1,000 次/天, https://ipapi.is/)        当前: ${C_CYAN}$(mask_api_key "${IPAPI_IS_API_KEY:-}")${C_RESET}"
+        echo -e "  ${C_GREEN}2)${C_RESET} AbuseIPDB        (免费 1,000 次/天, https://www.abuseipdb.com/) 当前: ${C_CYAN}$(mask_api_key "${ABUSEIPDB_API_KEY:-}")${C_RESET}"
+        echo -e "  ${C_GREEN}3)${C_RESET} ipdata           (免费 1,500 次/天, https://ipdata.co/)       当前: ${C_CYAN}$(mask_api_key "${IPDATA_API_KEY:-}")${C_RESET}"
+        echo -e "  ${C_GREEN}4)${C_RESET} IPQS             (免费 5,000 次/月, https://www.ipqualityscore.com/) 当前: ${C_CYAN}$(mask_api_key "${IPQS_API_KEY:-}")${C_RESET}"
+        echo -e "  ${C_GREEN}5)${C_RESET} MaxMind GeoLite2 (免费账号+Key, https://www.maxmind.com/)     当前: ${C_CYAN}$(mask_api_key "${MAXMIND_LICENSE_KEY:-}")${C_RESET}"
+        echo -e "  ${C_GREEN}6)${C_RESET} IP2Location.io   (可选加速Key, 免Key已可用)                   当前: ${C_CYAN}$(mask_api_key "${IP2LOCATION_API_KEY:-}")${C_RESET}"
+        echo -e "  ${C_GREEN}7)${C_RESET} ipregistry       (可选自有Key, 免Key已可用)                   当前: ${C_CYAN}$(mask_api_key "${IPREGISTRY_API_KEY:-}")${C_RESET}"
+        echo -e "  ${C_GREEN}8)${C_RESET} DB-IP            (可选自有Key, 免Key已可用)                   当前: ${C_CYAN}$(mask_api_key "${DBIP_API_KEY:-}")${C_RESET}"
+        echo -e "  ${C_YELLOW}0)${C_RESET} 保存并返回"
+        echo ""
+
+        local sel="" val=""
+        tty_read "请选择要配置的数据库编号 [0-8] (默认 0): " sel
+        sel="${sel:-0}"
+        case "$sel" in
+            0|q|Q)
+                save_keys_config
+                echo ""
+                return 0
+                ;;
+            1)
+                tty_read "请输入 IPAPI_IS_API_KEY (输入 clear 清空, 回车取消): " val 1
+                [[ "$val" == "clear" ]] && IPAPI_IS_API_KEY="" || [[ -n "$val" ]] && IPAPI_IS_API_KEY="$val"
+                export IPAPI_IS_API_KEY
+                ;;
+            2)
+                tty_read "请输入 ABUSEIPDB_API_KEY (输入 clear 清空, 回车取消): " val 1
+                [[ "$val" == "clear" ]] && ABUSEIPDB_API_KEY="" || [[ -n "$val" ]] && ABUSEIPDB_API_KEY="$val"
+                export ABUSEIPDB_API_KEY
+                ;;
+            3)
+                tty_read "请输入 IPDATA_API_KEY (输入 clear 清空, 回车取消): " val 1
+                [[ "$val" == "clear" ]] && IPDATA_API_KEY="" || [[ -n "$val" ]] && IPDATA_API_KEY="$val"
+                export IPDATA_API_KEY
+                ;;
+            4)
+                tty_read "请输入 IPQS_API_KEY (输入 clear 清空, 回车取消): " val 1
+                [[ "$val" == "clear" ]] && IPQS_API_KEY="" || [[ -n "$val" ]] && IPQS_API_KEY="$val"
+                export IPQS_API_KEY
+                ;;
+            5)
+                local mm_id="" mm_key=""
+                tty_read "请输入 MAXMIND_ACCOUNT_ID (输入 clear 清空, 回车取消): " mm_id
+                if [[ "$mm_id" == "clear" ]]; then
+                    MAXMIND_ACCOUNT_ID=""
+                    MAXMIND_LICENSE_KEY=""
+                elif [[ -n "$mm_id" ]]; then
+                    tty_read "请输入 MAXMIND_LICENSE_KEY (输入不回显): " mm_key 1
+                    if [[ -n "$mm_key" ]]; then
+                        MAXMIND_ACCOUNT_ID="$mm_id"
+                        MAXMIND_LICENSE_KEY="$mm_key"
+                    fi
+                fi
+                export MAXMIND_ACCOUNT_ID MAXMIND_LICENSE_KEY
+                ;;
+            6)
+                tty_read "请输入 IP2LOCATION_API_KEY (输入 clear 清空, 回车取消): " val 1
+                [[ "$val" == "clear" ]] && IP2LOCATION_API_KEY="" || [[ -n "$val" ]] && IP2LOCATION_API_KEY="$val"
+                export IP2LOCATION_API_KEY
+                ;;
+            7)
+                tty_read "请输入 IPREGISTRY_API_KEY (输入 clear 清空, 回车取消): " val 1
+                [[ "$val" == "clear" ]] && IPREGISTRY_API_KEY="" || [[ -n "$val" ]] && IPREGISTRY_API_KEY="$val"
+                export IPREGISTRY_API_KEY
+                ;;
+            8)
+                tty_read "请输入 DBIP_API_KEY (输入 clear 清空, 回车取消): " val 1
+                [[ "$val" == "clear" ]] && DBIP_API_KEY="" || [[ -n "$val" ]] && DBIP_API_KEY="$val"
+                export DBIP_API_KEY
+                ;;
+            *)
+                echo -e "${C_YELLOW}无效编号，请输入 0-8。${C_RESET}"
+                ;;
+        esac
+        echo ""
+    done
 }
 
 # ==============================================================================
@@ -629,6 +796,26 @@ format_ip_display() {
     else
         mask_ip "$ip"
     fi
+}
+
+mask_rdns_for_privacy() {
+    local host="$1"
+    local ip="$2"
+    [[ -z "$host" ]] && return
+    if [[ "$PRIVACY_MODE" == "2" ]]; then
+        echo "$host"
+        return
+    fi
+    if is_ipv4_literal "$ip"; then
+        local IFS='.'
+        local -a o=($ip)
+        local p1="${o[0]}" p2="${o[1]}" p3="${o[2]}" p4="${o[3]}"
+        # 遮蔽 PTR 中嵌入的正序/倒序 IPv4 中间两段（如 1-2-3-4.isp.com / 4.3.2.1.isp.com）
+        host=$(printf '%s' "$host" | sed -E \
+            -e "s/(^|[^0-9])${p1}([.-])${p2}([.-])${p3}([.-])${p4}([^0-9]|$)/\1${p1}\2*\3*\4${p4}\5/g" \
+            -e "s/(^|[^0-9])${p4}([.-])${p3}([.-])${p2}([.-])${p1}([^0-9]|$)/\1${p4}\2*\3*\4${p1}\5/g")
+    fi
+    echo "$host"
 }
 
 mask_proxy_url() {
@@ -1253,6 +1440,15 @@ step_advanced_options() {
     elif [[ "$mail_in" =~ ^[Nn]$ ]]; then
         MAIL_MODE="skip_user"
     fi
+
+    echo ""
+    local keys_in=""
+    local keys_state_txt="未配置(仅用9大免Key内置库)"
+    has_any_byok_keys && keys_state_txt="已配置部分扩展库Key"
+    tty_read "6) 是否查看/配置免费扩展数据库 API Key (ipapi.is/AbuseIPDB/ipdata/IPQS/MaxMind)? [y/N] (当前: ${keys_state_txt}): " keys_in
+    if [[ "$keys_in" =~ ^[Yy]$ ]]; then
+        configure_api_keys_interactive
+    fi
     echo ""
 }
 
@@ -1295,15 +1491,204 @@ show_summary() {
     elif [[ "$MAIL_MODE" == "skip_user" ]]; then
         echo -e "  25端口检测: 跳过"
     fi
-    if [[ -n "${ABUSEIPDB_API_KEY:-}" || -n "${IPQS_API_KEY:-}" ]]; then
-        echo -e "  自有Key:  ${C_GREEN}已启用扩展风控库${C_RESET}"
+    local byok_names=""
+    [[ -n "${IPAPI_IS_API_KEY:-}" ]]    && byok_names="${byok_names}${byok_names:+, }ipapi.is"
+    [[ -n "${ABUSEIPDB_API_KEY:-}" ]]   && byok_names="${byok_names}${byok_names:+, }AbuseIPDB"
+    [[ -n "${IPDATA_API_KEY:-}" ]]      && byok_names="${byok_names}${byok_names:+, }ipdata"
+    [[ -n "${IPQS_API_KEY:-}" ]]        && byok_names="${byok_names}${byok_names:+, }IPQS"
+    [[ -n "${MAXMIND_ACCOUNT_ID:-}" && -n "${MAXMIND_LICENSE_KEY:-}" ]] && byok_names="${byok_names}${byok_names:+, }MaxMind"
+    [[ -n "${IP2LOCATION_API_KEY:-}" ]] && byok_names="${byok_names}${byok_names:+, }IP2Location"
+    [[ -n "${IPREGISTRY_API_KEY:-}" ]]  && byok_names="${byok_names}${byok_names:+, }ipregistry"
+    [[ -n "${DBIP_API_KEY:-}" ]]        && byok_names="${byok_names}${byok_names:+, }DB-IP"
+    if [[ -n "$byok_names" ]]; then
+        echo -e "  自有Key:  ${C_GREEN}${byok_names}${C_RESET}"
     fi
     echo -e "${C_BOLD}${C_CYAN}==========================================================${C_RESET}"
 }
 
 # ==============================================================================
+# 地理信息本地化（纯本地 ISO-3166 国家/洲际映射与 DMS 度分秒坐标转换，零外链依赖）
+# ==============================================================================
+
+format_dms() {
+    local lat="$1" lon="$2"
+    [[ -z "$lat" || -z "$lon" || "$lat" == "null" || "$lon" == "null" ]] && return
+    awk -v lat="$lat" -v lon="$lon" '
+        function to_dms(v, pos, neg,    dir, deg, rem, min, sec) {
+            dir = pos
+            if (v < 0) { dir = neg; v = -v }
+            deg = int(v)
+            rem = (v - deg) * 60
+            min = int(rem)
+            sec = int((rem - min) * 60 + 0.5)
+            if (sec >= 60) { sec = 0; min++ }
+            if (min >= 60) { min = 0; deg++ }
+            return sprintf("%d°%d′%d″%s", deg, min, sec, dir)
+        }
+        BEGIN {
+            if (lat !~ /^-?[0-9]+(\.[0-9]+)?$/ || lon !~ /^-?[0-9]+(\.[0-9]+)?$/) exit 1
+            printf "%s, %s", to_dms(lon + 0, "E", "W"), to_dms(lat + 0, "N", "S")
+        }
+    ' 2>/dev/null || true
+}
+
+format_map_url() {
+    local lat="$1" lon="$2"
+    [[ -z "$lat" || -z "$lon" || "$lat" == "null" || "$lon" == "null" ]] && return
+    awk -v lat="$lat" -v lon="$lon" '
+        BEGIN {
+            if (lat !~ /^-?[0-9]+(\.[0-9]+)?$/ || lon !~ /^-?[0-9]+(\.[0-9]+)?$/) exit 1
+            printf "https://maps.google.com/?q=%.4f,%.4f", lat + 0, lon + 0
+        }
+    ' 2>/dev/null || true
+}
+
+lookup_continent_name() {
+    local code
+    code=$(echo "${1:-}" | tr '[:lower:]' '[:upper:]')
+    if [[ "$LANG_CODE" == "en" ]]; then
+        case "$code" in
+            AS) echo "Asia" ;;
+            EU) echo "Europe" ;;
+            NA) echo "North America" ;;
+            SA) echo "South America" ;;
+            OC) echo "Oceania" ;;
+            AF) echo "Africa" ;;
+            AN) echo "Antarctica" ;;
+            *)  echo "" ;;
+        esac
+    else
+        case "$code" in
+            AS) echo "亚洲" ;;
+            EU) echo "欧洲" ;;
+            NA) echo "北美洲" ;;
+            SA) echo "南美洲" ;;
+            OC) echo "大洋洲" ;;
+            AF) echo "非洲" ;;
+            AN) echo "南极洲" ;;
+            *)  echo "" ;;
+        esac
+    fi
+}
+
+lookup_continent_from_cc() {
+    local cc
+    cc=$(echo "${1:-}" | tr '[:lower:]' '[:upper:]')
+    case "$cc" in
+        AF|AM|AZ|BH|BD|BT|BN|KH|CN|CY|GE|HK|IN|ID|IR|IQ|IL|JP|JO|KZ|KW|KG|LA|LB|MO|MY|MV|MN|MM|NP|KP|OM|PK|PS|PH|QA|SA|SG|KR|LK|SY|TW|TJ|TH|TL|TR|TM|AE|UZ|VN|YE) echo "AS" ;;
+        AL|AD|AT|BY|BE|BA|BG|HR|CZ|DK|EE|FO|FI|FR|DE|GI|GR|GG|HU|IS|IE|IM|IT|JE|XK|LV|LI|LT|LU|MT|MD|MC|ME|NL|MK|NO|PL|PT|RO|RU|SM|RS|SK|SI|ES|SJ|SE|CH|UA|GB|VA|AX) echo "EU" ;;
+        AG|AI|AW|BS|BB|BZ|BM|BQ|VG|CA|KY|CR|CU|CW|DM|DO|SV|GL|GD|GP|GT|HT|HN|JM|MQ|MX|MS|NI|PA|PR|BL|KN|LC|MF|PM|VC|SX|TT|TC|US|VI) echo "NA" ;;
+        AR|BO|BR|CL|CO|EC|FK|GF|GY|PY|PE|SR|UY|VE) echo "SA" ;;
+        AS|AU|CK|FJ|PF|GU|KI|MH|FM|NR|NC|NZ|NU|NF|MP|PW|PG|PN|WS|SB|TK|TO|TV|UM|VU|WF) echo "OC" ;;
+        DZ|AO|BJ|BW|BF|BI|CV|CM|CF|TD|KM|CG|CD|CI|DJ|EG|GQ|ER|SZ|ET|GA|GM|GH|GN|GW|KE|LS|LR|LY|MG|MW|ML|MR|MU|YT|MA|MZ|NA|NE|NG|RE|RW|SH|ST|SN|SC|SL|SO|ZA|SS|SD|TZ|TG|TN|UG|EH|ZM|ZW) echo "AF" ;;
+        AQ|BV|TF|HM|GS) echo "AN" ;;
+        *) echo "" ;;
+    esac
+}
+
+lookup_country_cn() {
+    local cc
+    cc=$(echo "${1:-}" | tr '[:lower:]' '[:upper:]')
+    case "$cc" in
+        US) echo "美国" ;; CN) echo "中国" ;; HK) echo "中国香港" ;; TW) echo "中国台湾" ;; MO) echo "中国澳门" ;;
+        JP) echo "日本" ;; SG) echo "新加坡" ;; KR) echo "韩国" ;; GB) echo "英国" ;; DE) echo "德国" ;;
+        FR) echo "法国" ;; NL) echo "荷兰" ;; CA) echo "加拿大" ;; AU) echo "澳大利亚" ;; RU) echo "俄罗斯" ;;
+        IN) echo "印度" ;; BR) echo "巴西" ;; IT) echo "意大利" ;; ES) echo "西班牙" ;; CH) echo "瑞士" ;;
+        SE) echo "瑞典" ;; NO) echo "挪威" ;; FI) echo "芬兰" ;; DK) echo "丹麦" ;; PL) echo "波兰" ;;
+        AT) echo "奥地利" ;; BE) echo "比利时" ;; IE) echo "爱尔兰" ;; PT) echo "葡萄牙" ;; CZ) echo "捷克" ;;
+        LU) echo "卢森堡" ;; RO) echo "罗马尼亚" ;; BG) echo "保加利亚" ;; HU) echo "匈牙利" ;; GR) echo "希腊" ;;
+        TR) echo "土耳其" ;; UA) echo "乌克兰" ;; BY) echo "白俄罗斯" ;; KZ) echo "哈萨克斯坦" ;; VN) echo "越南" ;;
+        TH) echo "泰国" ;; MY) echo "马来西亚" ;; ID) echo "印度尼西亚" ;; PH) echo "菲律宾" ;; NZ) echo "新西兰" ;;
+        MX) echo "墨西哥" ;; AR) echo "阿根廷" ;; CL) echo "智利" ;; CO) echo "哥伦比亚" ;; PE) echo "秘鲁" ;;
+        ZA) echo "南非" ;; EG) echo "埃及" ;; NG) echo "尼日利亚" ;; KE) echo "肯尼亚" ;; MA) echo "摩洛哥" ;;
+        AE) echo "阿联酋" ;; SA) echo "沙特阿拉伯" ;; IL) echo "以色列" ;; QA) echo "卡塔尔" ;; KW) echo "科威特" ;;
+        BH) echo "巴林" ;; OM) echo "阿曼" ;; JO) echo "约旦" ;; PK) echo "巴基斯坦" ;; BD) echo "孟加拉国" ;;
+        LK) echo "斯里兰卡" ;; NP) echo "尼泊尔" ;; MM) echo "缅甸" ;; KH) echo "柬埔寨" ;; LA) echo "老挝" ;;
+        MN) echo "蒙古" ;; KP) echo "朝鲜" ;; IR) echo "伊朗" ;; IQ) echo "伊拉克" ;; SY) echo "叙利亚" ;;
+        AF) echo "阿富汗" ;; UZ) echo "乌兹别克斯坦" ;; AZ) echo "阿塞拜疆" ;; GE) echo "格鲁吉亚" ;; AM) echo "亚美尼亚" ;;
+        CY) echo "塞浦路斯" ;; MT) echo "马耳他" ;; IS) echo "冰岛" ;; SK) echo "斯洛伐克" ;; SI) echo "斯洛文尼亚" ;;
+        HR) echo "克罗地亚" ;; RS) echo "塞尔维亚" ;; BA) echo "波黑" ;; ME) echo "黑山" ;; AL) echo "阿尔巴尼亚" ;;
+        MK) echo "北马其顿" ;; MD) echo "摩尔多瓦" ;; EE) echo "爱沙尼亚" ;; LV) echo "拉脱维亚" ;; LT) echo "立陶宛" ;;
+        MC) echo "摩纳哥" ;; LI) echo "列支敦士登" ;; AD) echo "安道尔" ;; SM) echo "圣马力诺" ;; GI) echo "直布罗陀" ;;
+        PA) echo "巴拿马" ;; CR) echo "哥斯达黎加" ;; UY) echo "乌拉圭" ;; PY) echo "巴拉圭" ;; EC) echo "厄瓜多尔" ;;
+        BO) echo "玻利维亚" ;; VE) echo "委内瑞拉" ;; CU) echo "古巴" ;; DO) echo "多米尼加" ;; PR) echo "波多黎各" ;;
+        JM) echo "牙买加" ;; BS) echo "巴哈马" ;; KY) echo "开曼群岛" ;; VG) echo "英属维尔京群岛" ;; BM) echo "百慕大" ;;
+        SC) echo "塞舌尔" ;; MU) echo "毛里求斯" ;; TN) echo "突尼斯" ;; DZ) echo "阿尔及利亚" ;; GH) echo "加纳" ;;
+        ET) echo "埃塞俄比亚" ;; TZ) echo "坦桑尼亚" ;; UG) echo "乌干达" ;; AO) echo "安哥拉" ;; ZW) echo "津巴布韦" ;;
+        GT) echo "危地马拉" ;; HN) echo "洪都拉斯" ;; SV) echo "萨尔瓦多" ;; NI) echo "尼加拉瓜" ;; BZ) echo "伯利兹" ;;
+        BN) echo "文莱" ;; MV) echo "马尔代夫" ;; BT) echo "不丹" ;; KG) echo "吉尔吉斯斯坦" ;; TJ) echo "塔吉克斯坦" ;;
+        TM) echo "土库曼斯坦" ;; LB) echo "黎巴嫩" ;; YE) echo "也门" ;; PS) echo "巴勒斯坦" ;; FJ) echo "斐济" ;;
+        PG) echo "巴布亚新几内亚" ;; GU) echo "关岛" ;; GL) echo "格陵兰" ;; FO) echo "法罗群岛" ;; IM) echo "马恩岛" ;;
+        JE) echo "泽西岛" ;; GG) echo "根西岛" ;; CW) echo "库拉索" ;; AW) echo "阿鲁巴" ;; TT) echo "特立尼达和多巴哥" ;;
+        *) echo "" ;;
+    esac
+}
+
+lookup_country_en() {
+    local cc
+    cc=$(echo "${1:-}" | tr '[:lower:]' '[:upper:]')
+    case "$cc" in
+        US) echo "United States" ;; CN) echo "China" ;; HK) echo "Hong Kong" ;; TW) echo "Taiwan" ;; MO) echo "Macao" ;;
+        JP) echo "Japan" ;; SG) echo "Singapore" ;; KR) echo "South Korea" ;; GB) echo "United Kingdom" ;; DE) echo "Germany" ;;
+        FR) echo "France" ;; NL) echo "Netherlands" ;; CA) echo "Canada" ;; AU) echo "Australia" ;; RU) echo "Russia" ;;
+        IN) echo "India" ;; BR) echo "Brazil" ;; IT) echo "Italy" ;; ES) echo "Spain" ;; CH) echo "Switzerland" ;;
+        SE) echo "Sweden" ;; NO) echo "Norway" ;; FI) echo "Finland" ;; DK) echo "Denmark" ;; PL) echo "Poland" ;;
+        AT) echo "Austria" ;; BE) echo "Belgium" ;; IE) echo "Ireland" ;; PT) echo "Portugal" ;; CZ) echo "Czechia" ;;
+        LU) echo "Luxembourg" ;; RO) echo "Romania" ;; BG) echo "Bulgaria" ;; HU) echo "Hungary" ;; GR) echo "Greece" ;;
+        TR) echo "Turkey" ;; UA) echo "Ukraine" ;; BY) echo "Belarus" ;; KZ) echo "Kazakhstan" ;; VN) echo "Vietnam" ;;
+        TH) echo "Thailand" ;; MY) echo "Malaysia" ;; ID) echo "Indonesia" ;; PH) echo "Philippines" ;; NZ) echo "New Zealand" ;;
+        MX) echo "Mexico" ;; AR) echo "Argentina" ;; CL) echo "Chile" ;; CO) echo "Colombia" ;; PE) echo "Peru" ;;
+        ZA) echo "South Africa" ;; EG) echo "Egypt" ;; NG) echo "Nigeria" ;; KE) echo "Kenya" ;; MA) echo "Morocco" ;;
+        AE) echo "United Arab Emirates" ;; SA) echo "Saudi Arabia" ;; IL) echo "Israel" ;; QA) echo "Qatar" ;; KW) echo "Kuwait" ;;
+        CY) echo "Cyprus" ;; MT) echo "Malta" ;; IS) echo "Iceland" ;; SK) echo "Slovakia" ;; SI) echo "Slovenia" ;;
+        HR) echo "Croatia" ;; RS) echo "Serbia" ;; EE) echo "Estonia" ;; LV) echo "Latvia" ;; LT) echo "Lithuania" ;;
+        PA) echo "Panama" ;; SC) echo "Seychelles" ;; MU) echo "Mauritius" ;; MD) echo "Moldova" ;; GE) echo "Georgia" ;;
+        *) echo "" ;;
+    esac
+}
+
+format_country_display() {
+    local cc="$1"
+    local api_name="${2:-}"
+    local localized=""
+    if [[ "$LANG_CODE" == "en" ]]; then
+        localized=$(lookup_country_en "$cc")
+        [[ -z "$localized" ]] && localized="$api_name"
+        if [[ -n "$localized" && "$localized" != "N/A" ]]; then
+            echo "[${cc}] ${localized}"
+        else
+            echo "[${cc}]"
+        fi
+    else
+        localized=$(lookup_country_cn "$cc")
+        [[ -z "$localized" ]] && localized="$api_name"
+        if [[ -n "$localized" && "$localized" != "N/A" ]]; then
+            echo "[${cc}]${localized}"
+        else
+            echo "[${cc}]"
+        fi
+    fi
+}
+
+# ==============================================================================
 # 独立自研核心检测引擎：Phase 1 多源情报并行查询
 # ==============================================================================
+
+# 统一隔离直连抓取（所有数据库查询严格遵守代理/网卡隔离，绝不泄露宿主机 IP）
+curl_fetch_raw() {
+    local -a opts=()
+    if [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]]; then
+        opts+=("-K" "$ACTIVE_CURL_CFG")
+    elif [[ -n "$ACTIVE_IFACE" ]]; then
+        opts+=("--interface" "$ACTIVE_IFACE")
+        if is_ipv6_literal "$ACTIVE_IFACE"; then
+            opts+=("-6")
+        elif is_ipv4_literal "$ACTIVE_IFACE"; then
+            opts+=("-4")
+        fi
+    fi
+    curl ${opts[@]+"${opts[@]}"} "$@"
+}
 
 # 通用拉取工具：根据模式严格通过代理或指定网卡请求（IPv6 直连若目标 API 无 AAAA 则自动兼容）
 fetch_db_json() {
@@ -1312,20 +1697,7 @@ fetch_db_json() {
     local out_file="$3"
     local resp=""
 
-    if [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]]; then
-        resp=$(curl -K "$ACTIVE_CURL_CFG" -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" "$url" 2>/dev/null || true)
-    elif [[ -n "$ACTIVE_IFACE" ]]; then
-        if is_ipv6_literal "$ACTIVE_IFACE"; then
-            resp=$(curl --interface "$ACTIVE_IFACE" -6 -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" "$url" 2>/dev/null || true)
-        elif is_ipv4_literal "$ACTIVE_IFACE"; then
-            resp=$(curl --interface "$ACTIVE_IFACE" -4 -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" "$url" 2>/dev/null || true)
-        else
-            resp=$(curl --interface "$ACTIVE_IFACE" -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" "$url" 2>/dev/null || true)
-        fi
-    else
-        resp=$(curl -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" "$url" 2>/dev/null || true)
-    fi
-
+    resp=$(curl_fetch_raw -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" "$url" 2>/dev/null || true)
     if [[ -n "$resp" ]] && echo "$resp" | jq -e . >/dev/null 2>&1; then
         printf '%s' "$resp" > "$out_file"
     else
@@ -1333,25 +1705,139 @@ fetch_db_json() {
     fi
 }
 
+# ipregistry 官方直连（支持自有 IPREGISTRY_API_KEY；否则使用官网公开 Demo Key 并在失效时自动刷新）
+fetch_ipregistry_data() {
+    local ip="$1"
+    local stack="$2"
+    local out_file="$3"
+    local resp=""
+
+    if [[ -n "${IPREGISTRY_API_KEY:-}" ]]; then
+        resp=$(printf 'header = "Authorization: ApiKey %s"\n' "$IPREGISTRY_API_KEY" | \
+            curl_fetch_raw -K - -fsL --compressed --connect-timeout 4 --max-time 8 -A "$UA_CHROME" \
+            "https://api.ipregistry.co/${ip}?hostname=true" 2>/dev/null || true)
+        if [[ -n "$resp" ]] && echo "$resp" | jq -e '.ip' >/dev/null 2>&1; then
+            printf '%s' "$resp" > "$out_file"
+            return
+        fi
+    fi
+
+    local demo_key="sb69ksjcajfs4c"
+    resp=$(curl_fetch_raw -fsL --compressed --connect-timeout 4 --max-time 8 \
+        -H "Origin: https://ipregistry.co" \
+        -H "Referer: https://ipregistry.co/" \
+        -A "$UA_CHROME" \
+        "https://api.ipregistry.co/${ip}?hostname=true&key=${demo_key}" 2>/dev/null || true)
+
+    if [[ -z "$resp" ]] || ! echo "$resp" | jq -e '.ip' >/dev/null 2>&1; then
+        local html fresh_key=""
+        html=$(curl_fetch_raw -fsL --connect-timeout 4 --max-time 7 -A "$UA_CHROME" "https://ipregistry.co" 2>/dev/null || true)
+        fresh_key=$(echo "$html" | grep -oE 'apiKey="[a-zA-Z0-9_-]+"' | head -n1 | cut -d'"' -f2 || true)
+        if [[ -n "$fresh_key" && "$fresh_key" != "$demo_key" ]]; then
+            resp=$(curl_fetch_raw -fsL --compressed --connect-timeout 4 --max-time 8 \
+                -H "Origin: https://ipregistry.co" \
+                -H "Referer: https://ipregistry.co/" \
+                -A "$UA_CHROME" \
+                "https://api.ipregistry.co/${ip}?hostname=true&key=${fresh_key}" 2>/dev/null || true)
+        fi
+    fi
+
+    if [[ -n "$resp" ]] && echo "$resp" | jq -e '.ip' >/dev/null 2>&1; then
+        printf '%s' "$resp" > "$out_file"
+    else
+        printf '{}' > "$out_file"
+    fi
+}
+
+# IP2Location 完整 PX12 直连（优先自有 IP2LOCATION_API_KEY -> 其次官方演示页内嵌完整 PX12 JSON -> 自动回退 api.ip2location.io）
+fetch_ip2location_data() {
+    local ip="$1"
+    local stack="$2"
+    local out_file="$3"
+    local resp=""
+
+    if [[ -n "${IP2LOCATION_API_KEY:-}" ]]; then
+        resp=$(printf 'url = "https://api.ip2location.io/?key=%s&ip=%s&format=json"\n' "$IP2LOCATION_API_KEY" "$ip" | \
+            curl_fetch_raw -K - -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" 2>/dev/null || true)
+        if [[ -n "$resp" ]] && echo "$resp" | jq -e '.ip' >/dev/null 2>&1; then
+            printf '%s' "$resp" > "$out_file"
+            return
+        fi
+    fi
+
+    local html extracted=""
+    html=$(curl_fetch_raw -fsL --compressed --connect-timeout 4 --max-time 9 -A "$UA_CHROME" "https://www.ip2location.com/demo/${ip}" 2>/dev/null || true)
+    if [[ -n "$html" ]]; then
+        extracted=$(printf '%s\n' "$html" | awk '
+            /class="language-json"/ { in_json=1; sub(/.*class="language-json">/, "") }
+            in_json {
+                if (/<\/code>/) {
+                    sub(/<\/code>.*/, "")
+                    print
+                    exit
+                }
+                print
+            }
+        ' | sed "s/&amp;/\\&/g; s/&quot;/\"/g; s/&#039;/'/g; s/&lt;/</g; s/&gt;/>/g")
+        if [[ -n "$extracted" ]] && echo "$extracted" | jq -e '.ip' >/dev/null 2>&1; then
+            printf '%s' "$extracted" > "$out_file"
+            return
+        fi
+    fi
+
+    # 回退到 api.ip2location.io 免 Key 基础接口
+    fetch_db_json "https://api.ip2location.io/?ip=${ip}" "$stack" "$out_file"
+}
+
+# DB-IP 官方直连（优先自有 DBIP_API_KEY -> 其次官方公开 Demo 接口拿威胁评级/代理/爬虫 -> 超限自动回退 /v2/free/）
+fetch_dbip_data() {
+    local ip="$1"
+    local stack="$2"
+    local out_file="$3"
+    local resp=""
+
+    if [[ -n "${DBIP_API_KEY:-}" ]]; then
+        resp=$(printf 'url = "https://api.db-ip.com/v2/%s/%s"\n' "$DBIP_API_KEY" "$ip" | \
+            curl_fetch_raw -K - -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" 2>/dev/null || true)
+        if [[ -n "$resp" ]] && echo "$resp" | jq -e '.countryCode and (.errorCode == null)' >/dev/null 2>&1; then
+            printf '%s' "$resp" > "$out_file"
+            return
+        fi
+    fi
+
+    # 尝试官方公开 Core Demo 接口（有每日共享额度，若命中则含 threatLevel/isProxy/isCrawler）
+    local core_html demo_key=""
+    core_html=$(curl_fetch_raw -fsL --connect-timeout 3 --max-time 6 -A "$UA_CHROME" "https://db-ip.com/api/core/" 2>/dev/null || true)
+    demo_key=$(echo "$core_html" | sed -n 's/.*data-api-key="\([^"]*\)".*/\1/p' | head -n1 || true)
+    if [[ -n "$demo_key" ]]; then
+        resp=$(curl_fetch_raw -fsL --connect-timeout 3 --max-time 6 \
+            -H "Origin: https://db-ip.com" \
+            -H "Referer: https://db-ip.com/" \
+            -A "$UA_CHROME" \
+            "https://api.db-ip.com/v2/${demo_key}/${ip}" 2>/dev/null || true)
+        if [[ -n "$resp" ]] && echo "$resp" | jq -e '.countryCode and (.errorCode == null)' >/dev/null 2>&1; then
+            printf '%s' "$resp" > "$out_file"
+            return
+        fi
+    fi
+
+    # 回退至 DB-IP 官方免费无限制基础接口（提供地区/洲际/省市）
+    fetch_db_json "https://api.db-ip.com/v2/free/${ip}" "$stack" "$out_file"
+}
+
 fetch_scamalytics_data() {
     local ip="$1"
     local out_file="$2"
     local html=""
 
-    if [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]]; then
-        html=$(curl -K "$ACTIVE_CURL_CFG" -fsL --connect-timeout 4 --max-time 9 -A "$UA_CHROME" "https://scamalytics.com/ip/${ip}" 2>/dev/null || true)
-    elif [[ -n "$ACTIVE_IFACE" ]]; then
-        html=$(curl --interface "$ACTIVE_IFACE" -fsL --connect-timeout 4 --max-time 9 -A "$UA_CHROME" "https://scamalytics.com/ip/${ip}" 2>/dev/null || true)
-    else
-        html=$(curl -fsL --connect-timeout 4 --max-time 9 -A "$UA_CHROME" "https://scamalytics.com/ip/${ip}" 2>/dev/null || true)
-    fi
+    html=$(curl_fetch_raw -fsL --connect-timeout 4 --max-time 9 -A "$UA_CHROME" "https://scamalytics.com/ip/${ip}" 2>/dev/null || true)
 
     if [[ -z "$html" ]]; then
         printf '{}' > "$out_file"
         return
     fi
 
-    local score risk cc vpn tor server proxy robot
+    local score risk cc vpn tor server proxy robot abuser hostname lat lon postal city region
     score=$(echo "$html" | grep -oE '"score":"[0-9]+"' | head -n1 | grep -oE '[0-9]+' || true)
     risk=$(echo "$html" | grep -oE '"risk":"[^"]+"' | head -n1 | cut -d'"' -f4 || true)
 
@@ -1367,6 +1853,13 @@ fetch_scamalytics_data() {
     ')
 
     cc=$(echo "$parsed" | awk -F'=>' '/Country Code/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')
+    hostname=$(echo "$parsed" | awk -F'=>' '/Hostname/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if (tolower($2)!="n/a") print $2; exit}')
+    region=$(echo "$parsed" | awk -F'=>' '/State \/ Province/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if (tolower($2)!="n/a") print $2; exit}')
+    city=$(echo "$parsed" | awk -F'=>' '/ City / {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if (tolower($2)!="n/a") print $2; exit}')
+    postal=$(echo "$parsed" | awk -F'=>' '/Postal Code/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if (tolower($2)!="n/a") print $2; exit}')
+    lat=$(echo "$parsed" | awk -F'=>' '/Latitude/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if (tolower($2)!="n/a") print $2; exit}')
+    lon=$(echo "$parsed" | awk -F'=>' '/Longitude/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if (tolower($2)!="n/a") print $2; exit}')
+
     vpn=$(echo "$parsed" | awk -F'=>' '/Anonymizing VPN/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit}')
     tor=$(echo "$parsed" | awk -F'=>' '/Tor Exit Node/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit}')
     server=$(echo "$parsed" | awk -F'=>' '/ Server / {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit}')
@@ -1374,54 +1867,99 @@ fetch_scamalytics_data() {
     if [[ -z "$proxy" ]] && echo "$parsed" | grep -q "Public Proxy"; then
         proxy="no"
     fi
-    robot=$(echo "$parsed" | awk -F'=>' '/Search Engine Robot/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit}')
+    abuser=$(echo "$parsed" | awk -F'=>' '/Firehol|IP2ProxyLite|IPsum|Spamhaus|X4Bnet Spambot/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if (tolower($2)=="yes") {print "yes"; exit}} END{}')
+    if [[ -z "$abuser" ]] && echo "$parsed" | grep -qE "Firehol|Spamhaus|IPsum"; then
+        abuser="no"
+    fi
+    robot=$(echo "$parsed" | awk -F'=>' '/Search Engine Robot|X4Bnet Spambot/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if (tolower($2)=="yes") {print "yes"; exit}} END{}')
+    if [[ -z "$robot" ]] && echo "$parsed" | grep -q "Search Engine Robot"; then
+        robot="no"
+    fi
 
     [[ "$vpn" == "yes" ]] && vpn="true" || { [[ "$vpn" == "no" ]] && vpn="false" || vpn="null"; }
     [[ "$tor" == "yes" ]] && tor="true" || { [[ "$tor" == "no" ]] && tor="false" || tor="null"; }
     [[ "$server" == "yes" ]] && server="true" || { [[ "$server" == "no" ]] && server="false" || server="null"; }
     [[ "$proxy" == "yes" ]] && proxy="true" || { [[ "$proxy" == "no" ]] && proxy="false" || proxy="null"; }
+    [[ "$abuser" == "yes" ]] && abuser="true" || { [[ "$abuser" == "no" ]] && abuser="false" || abuser="null"; }
     [[ "$robot" == "yes" ]] && robot="true" || { [[ "$robot" == "no" ]] && robot="false" || robot="null"; }
 
     jq -n \
         --arg score "${score:-}" \
         --arg risk "${risk:-}" \
         --arg cc "${cc:-}" \
+        --arg hostname "${hostname:-}" \
+        --arg region "${region:-}" \
+        --arg city "${city:-}" \
+        --arg postal "${postal:-}" \
+        --arg lat "${lat:-}" \
+        --arg lon "${lon:-}" \
         --arg vpn "$vpn" \
         --arg tor "$tor" \
         --arg server "$server" \
         --arg proxy "$proxy" \
+        --arg abuser "$abuser" \
         --arg robot "$robot" \
-        '{score: $score, risk: $risk, country: $cc, vpn: $vpn, tor: $tor, server: $server, proxy: $proxy, robot: $robot}' > "$out_file"
+        '{score: $score, risk: $risk, country: $cc, hostname: $hostname, region: $region, city: $city, postal: $postal, lat: $lat, lon: $lon, vpn: $vpn, tor: $tor, server: $server, proxy: $proxy, abuser: $abuser, robot: $robot}' > "$out_file"
 }
 
 fetch_optional_byok() {
     local ip="$1"
     local workdir="$2"
 
-    # 可选 AbuseIPDB（通过 stdin header 传递 API Key，防 ps aux 泄露）
+    # 可选 ipapi.is（免费 1,000 次/天，通过 curl -K - 传递含 Key 的 URL 防 ps aux 泄露）
+    if [[ -n "${IPAPI_IS_API_KEY:-}" ]]; then
+        local resp=""
+        resp=$(printf 'url = "https://api.ipapi.is/?q=%s&key=%s"\n' "$ip" "$IPAPI_IS_API_KEY" | \
+            curl_fetch_raw -K - -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" 2>/dev/null || true)
+        if [[ -n "$resp" ]] && echo "$resp" | jq -e '(.asn | type) == "object" or (.is_datacenter != null)' >/dev/null 2>&1; then
+            printf '%s' "$resp" > "${workdir}/db_ipapi_is.json"
+        fi
+    fi
+
+    # 可选 AbuseIPDB（免费 1,000 次/天，通过 stdin header 传递 API Key 防 ps aux 泄露）
     if [[ -n "${ABUSEIPDB_API_KEY:-}" ]]; then
         local resp=""
-        local -a extra=()
-        [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]] && extra+=("-K" "$ACTIVE_CURL_CFG")
-        [[ -z "$ACTIVE_CURL_CFG" && -n "$ACTIVE_IFACE" ]] && extra+=("--interface" "$ACTIVE_IFACE")
         resp=$(printf 'header = "Key: %s"\nheader = "Accept: application/json"\n' "$ABUSEIPDB_API_KEY" | \
-            curl -K - ${extra[@]+"${extra[@]}"} -fsL --connect-timeout 4 --max-time 8 \
+            curl_fetch_raw -K - -fsL --connect-timeout 4 --max-time 8 \
             "https://api.abuseipdb.com/api/v2/check?ipAddress=${ip}&maxAgeInDays=90" 2>/dev/null || true)
         if [[ -n "$resp" ]] && echo "$resp" | jq -e '.data' >/dev/null 2>&1; then
             printf '%s' "$resp" > "${workdir}/db_abuseipdb.json"
         fi
     fi
 
-    # 可选 IPQualityScore（通过 curl -K - 传递 URL，防 API Key 暴露在 ps aux）
+    # 可选 ipdata（免费 1,500 次/天，通过 curl -K - 传递 URL 防 ps aux 泄露）
+    if [[ -n "${IPDATA_API_KEY:-}" ]]; then
+        local resp=""
+        resp=$(printf 'url = "https://api.ipdata.co/%s?api-key=%s"\n' "$ip" "$IPDATA_API_KEY" | \
+            curl_fetch_raw -K - -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" 2>/dev/null || true)
+        if [[ -n "$resp" ]] && echo "$resp" | jq -e '.threat != null or .country_code != null' >/dev/null 2>&1; then
+            printf '%s' "$resp" > "${workdir}/db_ipdata.json"
+        fi
+    fi
+
+    # 可选 IPQualityScore（免费 5,000 次/月，通过 curl -K - 传递 URL 防 ps aux 泄露）
     if [[ -n "${IPQS_API_KEY:-}" ]]; then
         local resp=""
-        local -a extra=()
-        [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]] && extra+=("-K" "$ACTIVE_CURL_CFG")
-        [[ -z "$ACTIVE_CURL_CFG" && -n "$ACTIVE_IFACE" ]] && extra+=("--interface" "$ACTIVE_IFACE")
         resp=$(printf 'url = "https://www.ipqualityscore.com/api/json/ip/%s/%s?strictness=1"\n' "$IPQS_API_KEY" "$ip" | \
-            curl -K - ${extra[@]+"${extra[@]}"} -fsL --connect-timeout 4 --max-time 8 2>/dev/null || true)
+            curl_fetch_raw -K - -fsL --connect-timeout 4 --max-time 8 2>/dev/null || true)
         if [[ -n "$resp" ]] && echo "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
             printf '%s' "$resp" > "${workdir}/db_ipqs.json"
+        fi
+    fi
+
+    # 可选 MaxMind GeoLite2 / GeoIP2 官方 Web Services（通过 stdin user 字段传 Basic Auth）
+    if [[ -n "${MAXMIND_ACCOUNT_ID:-}" && -n "${MAXMIND_LICENSE_KEY:-}" ]]; then
+        local resp=""
+        resp=$(printf 'user = "%s:%s"\n' "$MAXMIND_ACCOUNT_ID" "$MAXMIND_LICENSE_KEY" | \
+            curl_fetch_raw -K - -fsL --connect-timeout 4 --max-time 8 \
+            "https://geolite.info/geoip/v2.1/city/${ip}" 2>/dev/null || true)
+        if [[ -z "$resp" ]] || ! echo "$resp" | jq -e '.country != null or .traits != null' >/dev/null 2>&1; then
+            resp=$(printf 'user = "%s:%s"\n' "$MAXMIND_ACCOUNT_ID" "$MAXMIND_LICENSE_KEY" | \
+                curl_fetch_raw -K - -fsL --connect-timeout 4 --max-time 8 \
+                "https://geoip.maxmind.com/geoip/v2.1/city/${ip}" 2>/dev/null || true)
+        fi
+        if [[ -n "$resp" ]] && echo "$resp" | jq -e '.country != null or .traits != null' >/dev/null 2>&1; then
+            printf '%s' "$resp" > "${workdir}/db_maxmind.json"
         fi
     fi
 }
@@ -1971,6 +2509,9 @@ scan_mail_port25() {
 # 经典 42 列三色渐变风险条（绿 0-33% -> 黄 33-66% -> 红 66-100%，分值与风险等级紧随进度条后，总宽 <= 72 列）
 render_risk_bar() {
     local score="$1"
+    local custom_score_disp="${2:-}"
+    local custom_risk_disp="${3:-}"
+    local custom_color="${4:-}"
     (( score < 0 )) && score=0
     (( score > 100 )) && score=100
 
@@ -1992,6 +2533,10 @@ render_risk_bar() {
         [[ "$LANG_CODE" == "en" ]] && risk_text="VeryHigh" || risk_text="极高风险"
     fi
 
+    [[ -n "$custom_risk_disp" ]] && risk_text="$custom_risk_disp"
+    [[ -n "$custom_color" ]] && risk_color="$custom_color"
+    local score_disp="${custom_score_disp:-$score}"
+
     local bar_w=42
     local fill_len=1
     if (( score > 0 )); then
@@ -2012,74 +2557,108 @@ render_risk_bar() {
     [[ -n "$s1" ]] && out+="${BG_GREEN}${C_BLACK}${s1}"
     [[ -n "$s2" ]] && out+="${BG_YELLOW}${C_BLACK}${s2}"
     [[ -n "$s3" ]] && out+="${BG_RED}${C_BLACK}${s3}"
-    out+="${C_RESET} ${risk_color}${C_BOLD}${score} ${risk_text}${C_RESET}"
+    if [[ "$score_disp" == "-" ]]; then
+        out+="${C_RESET} ${risk_color}${C_BOLD}${risk_text}${C_RESET}"
+    else
+        out+="${C_RESET} ${risk_color}${C_BOLD}${score_disp} ${risk_text}${C_RESET}"
+    fi
     printf "%b" "$out"
 }
 
-# 12 列定宽色块类型标签（用于「二、IP类型属性」横向矩阵，深色字体高对比度，未知/无使用紫色色块）
+# 10 列定宽色块类型标签（用于「二、IP类型属性」6 列横向矩阵，总宽 10 + 6*10 = 70 <= 72 列，深色字体高对比度，无/未知使用紫色色块）
 render_type_cell() {
-    local raw="$1"
+    local raw="${1:-}"
+    # IP2Location 支持 "ISP/MOB" 复合格式，取主类型
+    local primary="${raw%%/*}"
     local low
-    low=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
+    low=$(echo "$primary" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     if [[ "$LANG_CODE" == "en" ]]; then
         case "$low" in
-            isp|residential|"fixed line isp")
-                printf "   ${BG_GREEN}${C_BLACK} ISP ${C_RESET}    " ;;
-            mobile|wireless)
-                printf "  ${BG_GREEN}${C_BLACK} Mobile ${C_RESET}  " ;;
-            business|commercial)
-                printf " ${BG_YELLOW}${C_BLACK} Business ${C_RESET} " ;;
-            hosting|datacenter)
-                printf " ${BG_RED}${C_BLACK} Hosting ${C_RESET}  " ;;
+            isp|residential|"fixed line isp"|lineisp)
+                printf "  ${BG_GREEN}${C_BLACK} ISP  ${C_RESET}  " ;;
+            mobile|mob|wireless|"mobile isp")
+                printf " ${BG_GREEN}${C_BLACK} Mobile ${C_RESET} " ;;
+            business|commercial|com)
+                printf " ${BG_YELLOW}${C_BLACK}Business${C_RESET} " ;;
+            hosting|datacenter|dch|"data center"*)
+                printf " ${BG_RED}${C_BLACK}Hosting ${C_RESET} " ;;
+            cdn|"content delivery"*)
+                printf "  ${BG_RED}${C_BLACK} CDN  ${C_RESET}  " ;;
             vpn)
-                printf "   ${BG_RED}${C_BLACK} VPN ${C_RESET}    " ;;
+                printf "  ${BG_RED}${C_BLACK} VPN  ${C_RESET}  " ;;
             socks*|proxy|compromised)
-                printf "  ${BG_RED}${C_BLACK} Proxy ${C_RESET}   " ;;
-            education)
-                printf "${BG_YELLOW}${C_BLACK} Education ${C_RESET} " ;;
-            government)
-                printf "   ${BG_YELLOW}${C_BLACK} Gov. ${C_RESET}   " ;;
-            ""|null|unknown)
-                printf "   ${BG_PURPLE}${C_BLACK} N/A ${C_RESET}    " ;;
+                printf " ${BG_RED}${C_BLACK} Proxy  ${C_RESET} " ;;
+            education|edu|university*)
+                printf "  ${BG_YELLOW}${C_BLACK} Edu  ${C_RESET}  " ;;
+            government|gov)
+                printf "  ${BG_YELLOW}${C_BLACK} Gov  ${C_RESET}  " ;;
+            banking)
+                printf "  ${BG_YELLOW}${C_BLACK} Bank ${C_RESET}  " ;;
+            organization|org)
+                printf "  ${BG_YELLOW}${C_BLACK} Org  ${C_RESET}  " ;;
+            military|mil)
+                printf "  ${BG_YELLOW}${C_BLACK} Mil  ${C_RESET}  " ;;
+            library|lib)
+                printf "  ${BG_YELLOW}${C_BLACK} Lib  ${C_RESET}  " ;;
+            spider|ses|"search engine"*)
+                printf " ${BG_RED}${C_BLACK} Spider ${C_RESET} " ;;
+            reserved|rsv)
+                printf "  ${BG_YELLOW}${C_BLACK} Rsrv ${C_RESET}  " ;;
+            ""|null|unknown|-)
+                printf "  ${BG_PURPLE}${C_BLACK} N/A  ${C_RESET}  " ;;
             *)
-                printf "  ${BG_YELLOW}${C_BLACK} Other ${C_RESET}   " ;;
+                printf " ${BG_YELLOW}${C_BLACK} Other  ${C_RESET} " ;;
         esac
     else
         case "$low" in
-            isp|residential|"fixed line isp")
-                printf "  ${BG_GREEN}${C_BLACK} 家宽 ${C_RESET}    " ;;
-            mobile|wireless)
-                printf "  ${BG_GREEN}${C_BLACK} 移动 ${C_RESET}    " ;;
-            business|commercial)
-                printf "  ${BG_YELLOW}${C_BLACK} 商业 ${C_RESET}    " ;;
-            hosting|datacenter)
-                printf "  ${BG_RED}${C_BLACK} 机房 ${C_RESET}    " ;;
+            isp|residential|"fixed line isp"|lineisp)
+                printf "  ${BG_GREEN}${C_BLACK} 家宽 ${C_RESET}  " ;;
+            mobile|mob|wireless|"mobile isp")
+                printf "  ${BG_GREEN}${C_BLACK} 移动 ${C_RESET}  " ;;
+            business|commercial|com)
+                printf "  ${BG_YELLOW}${C_BLACK} 商业 ${C_RESET}  " ;;
+            hosting|datacenter|dch|"data center"*)
+                printf "  ${BG_RED}${C_BLACK} 机房 ${C_RESET}  " ;;
+            cdn|"content delivery"*)
+                printf "  ${BG_RED}${C_BLACK} CDN  ${C_RESET}  " ;;
             vpn)
-                printf "  ${BG_RED}${C_BLACK} VPN  ${C_RESET}    " ;;
+                printf "  ${BG_RED}${C_BLACK} VPN  ${C_RESET}  " ;;
             socks*|proxy|compromised)
-                printf "  ${BG_RED}${C_BLACK} 代理 ${C_RESET}    " ;;
-            education)
-                printf "  ${BG_YELLOW}${C_BLACK} 教育 ${C_RESET}    " ;;
-            government)
-                printf "  ${BG_YELLOW}${C_BLACK} 政府 ${C_RESET}    " ;;
-            ""|null|unknown)
-                printf "  ${BG_PURPLE}${C_BLACK}  无  ${C_RESET}    " ;;
+                printf "  ${BG_RED}${C_BLACK} 代理 ${C_RESET}  " ;;
+            education|edu|university*)
+                printf "  ${BG_YELLOW}${C_BLACK} 教育 ${C_RESET}  " ;;
+            government|gov)
+                printf "  ${BG_YELLOW}${C_BLACK} 政府 ${C_RESET}  " ;;
+            banking)
+                printf "  ${BG_YELLOW}${C_BLACK} 银行 ${C_RESET}  " ;;
+            organization|org)
+                printf "  ${BG_YELLOW}${C_BLACK} 组织 ${C_RESET}  " ;;
+            military|mil)
+                printf "  ${BG_YELLOW}${C_BLACK} 军队 ${C_RESET}  " ;;
+            library|lib)
+                printf " ${BG_YELLOW}${C_BLACK} 图书馆 ${C_RESET} " ;;
+            spider|ses|"search engine"*)
+                printf "  ${BG_RED}${C_BLACK} 蜘蛛 ${C_RESET}  " ;;
+            reserved|rsv)
+                printf "  ${BG_YELLOW}${C_BLACK} 保留 ${C_RESET}  " ;;
+            ""|null|unknown|-)
+                printf "  ${BG_PURPLE}${C_BLACK}  无  ${C_RESET}  " ;;
             *)
-                printf "  ${BG_YELLOW}${C_BLACK} 其他 ${C_RESET}    " ;;
+                printf "  ${BG_YELLOW}${C_BLACK} 其他 ${C_RESET}  " ;;
         esac
     fi
 }
 
-# 10 列定宽风险因子单元格（[US] / 是 / 否 / 无）
+# 8 列定宽风险因子单元格（8 + 8*8 = 72 列精确对齐，[US] / 是 / 否 / 无）
 render_factor_cc() {
     local cc="$1"
     if [[ -n "$cc" && "$cc" != "N/A" && "$cc" != "null" && ${#cc} -eq 2 ]]; then
-        printf "  ${C_GREEN}[%s]${C_RESET}    " "$cc"
+        printf "  ${C_GREEN}[%s]${C_RESET}  " "$cc"
     else
         if [[ "$LANG_CODE" == "en" ]]; then
-            printf "   ${C_PURPLE}N/A${C_RESET}    "
+            printf "  ${C_PURPLE}N/A${C_RESET}   "
         else
-            printf "   ${C_PURPLE}无${C_RESET}     "
+            printf "   ${C_PURPLE}无${C_RESET}   "
         fi
     fi
 }
@@ -2089,23 +2668,23 @@ render_factor_bool() {
     case "$val" in
         true|yes|1)
             if [[ "$LANG_CODE" == "en" ]]; then
-                printf "   ${C_RED}${C_BOLD}Yes${C_RESET}    "
+                printf "  ${C_RED}${C_BOLD}Yes${C_RESET}   "
             else
-                printf "   ${C_RED}${C_BOLD}是${C_RESET}     "
+                printf "   ${C_RED}${C_BOLD}是${C_RESET}   "
             fi
             ;;
         false|no|0)
             if [[ "$LANG_CODE" == "en" ]]; then
-                printf "   ${C_GREEN}${C_BOLD}No${C_RESET}     "
+                printf "   ${C_GREEN}${C_BOLD}No${C_RESET}   "
             else
-                printf "   ${C_GREEN}${C_BOLD}否${C_RESET}     "
+                printf "   ${C_GREEN}${C_BOLD}否${C_RESET}   "
             fi
             ;;
         *)
             if [[ "$LANG_CODE" == "en" ]]; then
-                printf "   ${C_PURPLE}N/A${C_RESET}    "
+                printf "  ${C_PURPLE}N/A${C_RESET}   "
             else
-                printf "   ${C_PURPLE}无${C_RESET}     "
+                printf "   ${C_PURPLE}无${C_RESET}   "
             fi
             ;;
     esac
@@ -2205,17 +2784,21 @@ run_single_ip_check() {
     local max_jobs batch_cnt=0
     max_jobs=$(detect_max_jobs)
 
-    # ---------------- Phase 1: 按容器安全并发上限分批查询 6 大独立 IP 情报库 ----------------
-    echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(1/3) 正在并发查询多源 IP 情报与风控数据库...${C_RESET}" >&2
+    # ---------------- Phase 1: 按容器安全并发上限分批查询 9 大独立免费 IP 情报库 + 可选扩展库 ----------------
+    echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(1/3) 正在并发查询多源 IP 情报与风控数据库 (9+ 权威源)...${C_RESET}" >&2
     local p1_task
-    for p1_task in ipinfo ipquery proxycheck scam ipapi ip2loc byok; do
+    for p1_task in ipinfo ipregistry ip2loc scam proxycheck ipquery ipapi dbip ipguide sfs byok; do
         case "$p1_task" in
             ipinfo)     fetch_db_json "https://ipinfo.io/widget/demo/${ip}" "$stack" "${run_dir}/db_ipinfo.json" & ;;
-            ipquery)    fetch_db_json "https://api.ipquery.io/${ip}" "$stack" "${run_dir}/db_ipquery.json" & ;;
-            proxycheck) fetch_db_json "https://proxycheck.io/v2/${ip}?vpn=1&asn=1&risk=1" "$stack" "${run_dir}/db_proxycheck.json" & ;;
+            ipregistry) fetch_ipregistry_data "$ip" "$stack" "${run_dir}/db_ipregistry.json" & ;;
+            ip2loc)     fetch_ip2location_data "$ip" "$stack" "${run_dir}/db_ip2loc.json" & ;;
             scam)       fetch_scamalytics_data "$ip" "${run_dir}/db_scam.json" & ;;
-            ipapi)      fetch_db_json "http://ip-api.com/json/${ip}?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,mobile,proxy,hosting" "$stack" "${run_dir}/db_ipapi.json" & ;;
-            ip2loc)     fetch_db_json "https://api.ip2location.io/?ip=${ip}" "$stack" "${run_dir}/db_ip2loc.json" & ;;
+            proxycheck) fetch_db_json "https://proxycheck.io/v2/${ip}?vpn=1&asn=1&risk=1" "$stack" "${run_dir}/db_proxycheck.json" & ;;
+            ipquery)    fetch_db_json "https://api.ipquery.io/${ip}" "$stack" "${run_dir}/db_ipquery.json" & ;;
+            ipapi)      fetch_db_json "http://ip-api.com/json/${ip}?fields=status,continent,continentCode,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,reverse,mobile,proxy,hosting" "$stack" "${run_dir}/db_ipapi.json" & ;;
+            dbip)       fetch_dbip_data "$ip" "$stack" "${run_dir}/db_dbip.json" & ;;
+            ipguide)    fetch_db_json "https://ip.guide/${ip}" "$stack" "${run_dir}/db_ipguide.json" & ;;
+            sfs)        fetch_db_json "https://api.stopforumspam.org/api?ip=${ip}&json" "$stack" "${run_dir}/db_sfs.json" & ;;
             byok)       fetch_optional_byok "$ip" "$run_dir" & ;;
         esac
         batch_cnt=$((batch_cnt + 1))
@@ -2268,110 +2851,377 @@ run_single_ip_check() {
 
     # ---------------- 聚合解析各数据源字段 ----------------
     local f_ipinfo="${run_dir}/db_ipinfo.json"
-    local f_ipquery="${run_dir}/db_ipquery.json"
-    local f_pcheck="${run_dir}/db_proxycheck.json"
-    local f_ipapi="${run_dir}/db_ipapi.json"
+    local f_ipreg="${run_dir}/db_ipregistry.json"
     local f_ip2loc="${run_dir}/db_ip2loc.json"
     local f_scam="${run_dir}/db_scam.json"
+    local f_pcheck="${run_dir}/db_proxycheck.json"
+    local f_ipquery="${run_dir}/db_ipquery.json"
+    local f_ipapi="${run_dir}/db_ipapi.json"
+    local f_dbip="${run_dir}/db_dbip.json"
+    local f_ipguide="${run_dir}/db_ipguide.json"
+    local f_sfs="${run_dir}/db_sfs.json"
+    local f_ipapi_is="${run_dir}/db_ipapi_is.json"
+    local f_abuse="${run_dir}/db_abuseipdb.json"
+    local f_ipdata="${run_dir}/db_ipdata.json"
+    local f_ipqs="${run_dir}/db_ipqs.json"
+    local f_maxmind="${run_dir}/db_maxmind.json"
 
-    # 基础信息（多源智能回退，保证即使单源限流也完整可用）
-    local asn org isp rdns country_code country_name region_name city_name timezone reg_country is_anycast
-    asn=$(jq -r '.data.asn.asn // empty' "$f_ipinfo" 2>/dev/null)
+    local has_maxmind=0
+    [[ -f "$f_maxmind" ]] && has_maxmind=1
+
+    # 基础信息（MaxMind 优先 + 9 大免费源智能融合回退，全面覆盖 ASN/组织/运营商/CIDR/RIR/rDNS/DMS坐标/地图/邮编/洲际/注册地/原生判定）
+    local asn="" org="" isp="" cidr="" rir="" rdns=""
+    local country_code="" country_name="" continent_code="" region_name="" city_name="" postal_code="" timezone="" reg_country=""
+    local lat="" lon="" dms="" map_url="" is_anycast="false"
+
+    if [[ $has_maxmind -eq 1 ]]; then
+        asn=$(jq -r '.traits.autonomous_system_number // empty' "$f_maxmind" 2>/dev/null | sed 's/^\([0-9]\)/AS\1/')
+        org=$(jq -r '.traits.autonomous_system_organization // .traits.organization // empty' "$f_maxmind" 2>/dev/null)
+        isp=$(jq -r '.traits.isp // empty' "$f_maxmind" 2>/dev/null)
+        cidr=$(jq -r '.traits.network // empty' "$f_maxmind" 2>/dev/null)
+        country_code=$(jq -r '.country.iso_code // empty' "$f_maxmind" 2>/dev/null)
+        country_name=$(jq -r '.country.names.en // empty' "$f_maxmind" 2>/dev/null)
+        continent_code=$(jq -r '.continent.code // empty' "$f_maxmind" 2>/dev/null)
+        reg_country=$(jq -r '.registered_country.iso_code // empty' "$f_maxmind" 2>/dev/null)
+        region_name=$(jq -r '.subdivisions[0].names.en // empty' "$f_maxmind" 2>/dev/null)
+        city_name=$(jq -r '.city.names.en // empty' "$f_maxmind" 2>/dev/null)
+        postal_code=$(jq -r '.postal.code // empty' "$f_maxmind" 2>/dev/null)
+        timezone=$(jq -r '.location.time_zone // empty' "$f_maxmind" 2>/dev/null)
+        lat=$(jq -r '.location.latitude // empty' "$f_maxmind" 2>/dev/null)
+        lon=$(jq -r '.location.longitude // empty' "$f_maxmind" 2>/dev/null)
+    fi
+
+    [[ -z "$asn" ]] && asn=$(jq -r '.data.asn.asn // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$asn" ]] && asn=$(jq -r '.connection.asn // empty' "$f_ipreg" 2>/dev/null | sed 's/^\([0-9]\)/AS\1/')
+    [[ -z "$asn" ]] && asn=$(jq -r '.asn // empty' "$f_ip2loc" 2>/dev/null | sed 's/^\([0-9]\)/AS\1/')
     [[ -z "$asn" ]] && asn=$(jq -r '.isp.asn // empty' "$f_ipquery" 2>/dev/null)
     [[ -z "$asn" ]] && asn=$(jq -r --arg ip "$ip" '.[$ip].asn // empty' "$f_pcheck" 2>/dev/null)
-    [[ -z "$asn" ]] && asn=$(jq -r '.asn // empty' "$f_ip2loc" 2>/dev/null | sed 's/^\([0-9]\)/AS\1/')
+    [[ -z "$asn" ]] && asn=$(jq -r '.network.autonomous_system.asn // empty' "$f_ipguide" 2>/dev/null | sed 's/^\([0-9]\)/AS\1/')
 
-    org=$(jq -r '.data.asn.name // .data.company.name // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$org" ]] && org=$(jq -r '.data.asn.name // .data.company.name // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$org" ]] && org=$(jq -r '.connection.organization // .company.name // empty' "$f_ipreg" 2>/dev/null)
+    [[ -z "$org" ]] && org=$(jq -r '.as // .isp // empty' "$f_ip2loc" 2>/dev/null)
     [[ -z "$org" ]] && org=$(jq -r '.isp.org // .isp.isp // empty' "$f_ipquery" 2>/dev/null)
     [[ -z "$org" ]] && org=$(jq -r --arg ip "$ip" '.[$ip].organisation // .[$ip].provider // empty' "$f_pcheck" 2>/dev/null)
     [[ -z "$org" ]] && org=$(jq -r '.org // .isp // empty' "$f_ipapi" 2>/dev/null)
+    [[ -z "$org" ]] && org=$(jq -r '.network.autonomous_system.organization // .network.autonomous_system.name // empty' "$f_ipguide" 2>/dev/null)
 
-    isp=$(jq -r '.isp.isp // empty' "$f_ipquery" 2>/dev/null)
+    [[ -z "$isp" ]] && isp=$(jq -r '.isp // empty' "$f_ip2loc" 2>/dev/null)
+    [[ -z "$isp" ]] && isp=$(jq -r '.isp.isp // empty' "$f_ipquery" 2>/dev/null)
     [[ -z "$isp" ]] && isp=$(jq -r --arg ip "$ip" '.[$ip].provider // empty' "$f_pcheck" 2>/dev/null)
-    [[ -z "$isp" ]] && isp="$org"
+    [[ -z "$isp" ]] && isp=$(jq -r '.isp // empty' "$f_ipapi" 2>/dev/null)
+    [[ -z "$isp" || "$isp" == "-" ]] && isp="$org"
+
+    [[ -z "$cidr" ]] && cidr=$(jq -r '.data.asn.route // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$cidr" ]] && cidr=$(jq -r '.as_info.as_cidr // empty' "$f_ip2loc" 2>/dev/null)
+    [[ -z "$cidr" ]] && cidr=$(jq -r '.network.cidr // empty' "$f_ipguide" 2>/dev/null)
+    [[ -z "$cidr" ]] && cidr=$(jq -r --arg ip "$ip" '.[$ip].range // empty' "$f_pcheck" 2>/dev/null)
+    [[ -z "$cidr" && -f "$f_ipapi_is" ]] && cidr=$(jq -r '.asn.route // empty' "$f_ipapi_is" 2>/dev/null)
+    [[ "$cidr" == "-" ]] && cidr=""
+
+    rir=$(jq -r '.network.autonomous_system.rir // empty' "$f_ipguide" 2>/dev/null)
+    [[ -z "$rir" && -f "$f_ipapi_is" ]] && rir=$(jq -r '.rir // .asn.rir // empty' "$f_ipapi_is" 2>/dev/null)
 
     rdns=$(jq -r '.data.hostname // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$rdns" ]] && rdns=$(jq -r '.hostname // empty' "$f_ipreg" 2>/dev/null)
+    [[ -z "$rdns" ]] && rdns=$(jq -r '.reverse // empty' "$f_ipapi" 2>/dev/null)
     [[ -z "$rdns" ]] && rdns=$(jq -r --arg ip "$ip" '.[$ip].hostname // empty' "$f_pcheck" 2>/dev/null)
+    [[ -z "$rdns" ]] && rdns=$(jq -r '.hostname // empty' "$f_scam" 2>/dev/null)
+    if [[ -z "$rdns" && -z "$ACTIVE_CURL_CFG" ]] && command -v dig >/dev/null 2>&1; then
+        rdns=$(dig +short +time=2 +tries=1 -x "$ip" 2>/dev/null | head -n1 | sed 's/\.$//' || true)
+    fi
+    # 过滤掉伪造/纯 IP/非法格式的 PTR 返回值，并在隐私模式下遮蔽嵌入主机名中的 IP 段
+    if [[ -n "$rdns" ]]; then
+        if is_valid_ip_literal "$rdns" || [[ ! "$rdns" =~ ^[a-zA-Z0-9._-]+$ ]] || [[ "$rdns" != *.* ]] || [[ ! "$rdns" =~ [a-zA-Z] ]]; then
+            rdns=""
+        else
+            rdns=$(mask_rdns_for_privacy "$rdns" "$ip")
+        fi
+    fi
 
-    country_code=$(jq -r '.data.country // empty' "$f_ipinfo" 2>/dev/null)
+    local cidr_disp=""
+    [[ -n "$cidr" ]] && cidr_disp=$(format_ip_display "$cidr")
+
+    [[ -z "$country_code" ]] && country_code=$(jq -r '.data.country // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$country_code" ]] && country_code=$(jq -r '.location.country.code // empty' "$f_ipreg" 2>/dev/null)
+    [[ -z "$country_code" ]] && country_code=$(jq -r '.country_code // empty' "$f_ip2loc" 2>/dev/null)
     [[ -z "$country_code" ]] && country_code=$(jq -r '.location.country_code // empty' "$f_ipquery" 2>/dev/null)
     [[ -z "$country_code" ]] && country_code=$(jq -r --arg ip "$ip" '.[$ip].isocode // empty' "$f_pcheck" 2>/dev/null)
     [[ -z "$country_code" ]] && country_code=$(jq -r '.countryCode // empty' "$f_ipapi" 2>/dev/null)
+    [[ -z "$country_code" ]] && country_code=$(jq -r '.countryCode // empty' "$f_dbip" 2>/dev/null)
+    [[ "$country_code" == "-" ]] && country_code=""
 
-    country_name=$(jq -r '.location.country // empty' "$f_ipquery" 2>/dev/null)
+    [[ -z "$country_name" ]] && country_name=$(jq -r '.location.country.name // empty' "$f_ipreg" 2>/dev/null)
+    [[ -z "$country_name" ]] && country_name=$(jq -r '.location.country // empty' "$f_ipquery" 2>/dev/null)
     [[ -z "$country_name" ]] && country_name=$(jq -r --arg ip "$ip" '.[$ip].country // empty' "$f_pcheck" 2>/dev/null)
     [[ -z "$country_name" ]] && country_name=$(jq -r '.country // empty' "$f_ipapi" 2>/dev/null)
     [[ -z "$country_name" ]] && country_name=$(jq -r '.country_name // empty' "$f_ip2loc" 2>/dev/null)
+    [[ -z "$country_name" ]] && country_name=$(jq -r '.countryName // empty' "$f_dbip" 2>/dev/null)
 
-    region_name=$(jq -r '.data.region // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$continent_code" ]] && continent_code=$(jq -r '.continent.code // empty' "$f_ip2loc" 2>/dev/null)
+    [[ -z "$continent_code" ]] && continent_code=$(jq -r '.location.continent.code // empty' "$f_ipreg" 2>/dev/null)
+    [[ -z "$continent_code" ]] && continent_code=$(jq -r --arg ip "$ip" '.[$ip].continentcode // empty' "$f_pcheck" 2>/dev/null)
+    [[ -z "$continent_code" ]] && continent_code=$(jq -r '.continentCode // empty' "$f_ipapi" 2>/dev/null)
+    [[ -z "$continent_code" ]] && continent_code=$(jq -r '.continentCode // empty' "$f_dbip" 2>/dev/null)
+    [[ -z "$continent_code" && -n "$country_code" ]] && continent_code=$(lookup_continent_from_cc "$country_code")
+
+    [[ -z "$region_name" ]] && region_name=$(jq -r '.data.region // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$region_name" ]] && region_name=$(jq -r '.location.region.name // empty' "$f_ipreg" 2>/dev/null)
+    [[ -z "$region_name" ]] && region_name=$(jq -r '.region_name // empty' "$f_ip2loc" 2>/dev/null)
     [[ -z "$region_name" ]] && region_name=$(jq -r '.location.state // empty' "$f_ipquery" 2>/dev/null)
     [[ -z "$region_name" ]] && region_name=$(jq -r '.regionName // empty' "$f_ipapi" 2>/dev/null)
+    [[ -z "$region_name" ]] && region_name=$(jq -r '.stateProv // empty' "$f_dbip" 2>/dev/null)
+    [[ -z "$region_name" ]] && region_name=$(jq -r '.region // empty' "$f_scam" 2>/dev/null)
+    [[ "$region_name" == "-" ]] && region_name=""
 
-    city_name=$(jq -r '.data.city // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$city_name" ]] && city_name=$(jq -r '.data.city // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$city_name" ]] && city_name=$(jq -r '.location.city // empty' "$f_ipreg" 2>/dev/null)
+    [[ -z "$city_name" ]] && city_name=$(jq -r '.city_name // empty' "$f_ip2loc" 2>/dev/null)
     [[ -z "$city_name" ]] && city_name=$(jq -r '.location.city // empty' "$f_ipquery" 2>/dev/null)
     [[ -z "$city_name" ]] && city_name=$(jq -r '.city // empty' "$f_ipapi" 2>/dev/null)
+    [[ -z "$city_name" ]] && city_name=$(jq -r '.city // empty' "$f_dbip" 2>/dev/null)
+    [[ -z "$city_name" ]] && city_name=$(jq -r '.city // empty' "$f_scam" 2>/dev/null)
+    [[ "$city_name" == "-" ]] && city_name=""
 
-    timezone=$(jq -r '.data.timezone // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$postal_code" ]] && postal_code=$(jq -r '.data.postal // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$postal_code" ]] && postal_code=$(jq -r '.zip_code // empty' "$f_ip2loc" 2>/dev/null)
+    [[ -z "$postal_code" ]] && postal_code=$(jq -r '.location.postal // empty' "$f_ipreg" 2>/dev/null)
+    [[ -z "$postal_code" ]] && postal_code=$(jq -r --arg ip "$ip" '.[$ip].postcode // empty' "$f_pcheck" 2>/dev/null)
+    [[ -z "$postal_code" ]] && postal_code=$(jq -r '.zip // empty' "$f_ipapi" 2>/dev/null)
+    [[ -z "$postal_code" ]] && postal_code=$(jq -r '.location.zipcode // empty' "$f_ipquery" 2>/dev/null)
+    [[ -z "$postal_code" ]] && postal_code=$(jq -r '.postal // empty' "$f_scam" 2>/dev/null)
+    [[ "$postal_code" == "-" || "$postal_code" == "null" ]] && postal_code=""
+
+    [[ -z "$timezone" ]] && timezone=$(jq -r '.data.timezone // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$timezone" ]] && timezone=$(jq -r '.time_zone.id // empty' "$f_ipreg" 2>/dev/null)
+    [[ -z "$timezone" ]] && timezone=$(jq -r '.time_zone_info.olson // empty' "$f_ip2loc" 2>/dev/null)
     [[ -z "$timezone" ]] && timezone=$(jq -r '.location.timezone // empty' "$f_ipquery" 2>/dev/null)
     [[ -z "$timezone" ]] && timezone=$(jq -r '.timezone // empty' "$f_ipapi" 2>/dev/null)
 
-    reg_country=$(jq -r '.data.abuse.country // empty' "$f_ipinfo" 2>/dev/null)
-    is_anycast=$(jq -r '.data.is_anycast // false' "$f_ipinfo" 2>/dev/null)
+    # 坐标与地图链接（多源回退，使用纯 awk 转 DMS 度分秒）
+    if [[ -z "$lat" || -z "$lon" ]]; then
+        local ii_loc
+        ii_loc=$(jq -r '.data.loc // empty' "$f_ipinfo" 2>/dev/null)
+        if [[ "$ii_loc" == *,* ]]; then
+            lat="${ii_loc%%,*}"
+            lon="${ii_loc#*,}"
+        fi
+    fi
+    if [[ -z "$lat" || -z "$lon" ]]; then
+        lat=$(jq -r '.latitude // empty' "$f_ip2loc" 2>/dev/null)
+        lon=$(jq -r '.longitude // empty' "$f_ip2loc" 2>/dev/null)
+    fi
+    if [[ -z "$lat" || -z "$lon" ]]; then
+        lat=$(jq -r '.location.latitude // empty' "$f_ipreg" 2>/dev/null)
+        lon=$(jq -r '.location.longitude // empty' "$f_ipreg" 2>/dev/null)
+    fi
+    if [[ -z "$lat" || -z "$lon" ]]; then
+        lat=$(jq -r '.location.latitude // empty' "$f_ipquery" 2>/dev/null)
+        lon=$(jq -r '.location.longitude // empty' "$f_ipquery" 2>/dev/null)
+    fi
+    if [[ -z "$lat" || -z "$lon" ]]; then
+        lat=$(jq -r '.lat // empty' "$f_ipapi" 2>/dev/null)
+        lon=$(jq -r '.lon // empty' "$f_ipapi" 2>/dev/null)
+    fi
+    if [[ -z "$lat" || -z "$lon" ]]; then
+        lat=$(jq -r '.lat // empty' "$f_scam" 2>/dev/null)
+        lon=$(jq -r '.lon // empty' "$f_scam" 2>/dev/null)
+    fi
+    if [[ -z "$lat" || -z "$lon" ]]; then
+        lat=$(jq -r '.location.latitude // empty' "$f_ipguide" 2>/dev/null)
+        lon=$(jq -r '.location.longitude // empty' "$f_ipguide" 2>/dev/null)
+    fi
+    if [[ -n "$lat" && -n "$lon" ]]; then
+        dms=$(format_dms "$lat" "$lon")
+        map_url=$(format_map_url "$lat" "$lon")
+    fi
 
-    # 类型字段
-    local t_ipinfo_use t_ipinfo_com t_pcheck
+    # 注册地多源回退（MaxMind -> IPinfo abuse -> ipapi.is ASN -> ip.guide RIR/ASN）
+    [[ -z "$reg_country" ]] && reg_country=$(jq -r '.data.abuse.country // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$reg_country" && -f "$f_ipapi_is" ]] && reg_country=$(jq -r '.asn.country // empty' "$f_ipapi_is" 2>/dev/null | tr '[:lower:]' '[:upper:]')
+    [[ -z "$reg_country" ]] && reg_country=$(jq -r '.network.autonomous_system.country // empty' "$f_ipguide" 2>/dev/null | tr '[:lower:]' '[:upper:]')
+    [[ "$reg_country" == "-" ]] && reg_country=""
+
+    if [[ "$(jq -r '.data.is_anycast // false' "$f_ipinfo" 2>/dev/null)" == "true" ]] || \
+       [[ "$(jq -r '.address_type // ""' "$f_ip2loc" 2>/dev/null)" == "Anycast" ]] || \
+       { [[ -f "$f_ipapi_is" ]] && [[ "$(jq -r '.is_anycast // false' "$f_ipapi_is" 2>/dev/null)" == "true" ]]; }; then
+        is_anycast="true"
+    fi
+
+    # 类型字段（6 大免Key直连库 + 可选 ipapi.is & AbuseIPDB 扩展库）
+    local t_ipinfo_use t_ipinfo_com t_ipreg_use t_ipreg_com t_ip2loc_use t_ip2loc_com t_pcheck
+    local t_ipapi_is_use="" t_ipapi_is_com="" t_abuse_use=""
     t_ipinfo_use=$(jq -r '.data.asn.type // ""' "$f_ipinfo" 2>/dev/null)
     t_ipinfo_com=$(jq -r '.data.company.type // ""' "$f_ipinfo" 2>/dev/null)
+    t_ipreg_use=$(jq -r '.connection.type // ""' "$f_ipreg" 2>/dev/null)
+    t_ipreg_com=$(jq -r '.company.type // ""' "$f_ipreg" 2>/dev/null)
+    t_ip2loc_use=$(jq -r '.usage_type // ""' "$f_ip2loc" 2>/dev/null)
+    t_ip2loc_com=$(jq -r '.as_info.as_usage_type // ""' "$f_ip2loc" 2>/dev/null)
     t_pcheck=$(jq -r --arg ip "$ip" '.[$ip].type // ""' "$f_pcheck" 2>/dev/null)
+    if [[ -f "$f_ipapi_is" ]]; then
+        t_ipapi_is_use=$(jq -r '.asn.type // ""' "$f_ipapi_is" 2>/dev/null)
+        t_ipapi_is_com=$(jq -r '.company.type // ""' "$f_ipapi_is" 2>/dev/null)
+    fi
+    if [[ -f "$f_abuse" ]]; then
+        t_abuse_use=$(jq -r '.data.usageType // ""' "$f_abuse" 2>/dev/null)
+    fi
 
-    # 各库风险分
-    local s_scam s_pcheck s_ipquery s_abuse="" s_ipqs=""
+    # 各库风险分（免Key直连: IP2Location / Scamalytics / ProxyCheck / IPQuery / DB-IP；扩展Key: ipapi.is / AbuseIPDB / IPQS）
+    local s_ip2loc="" s_scam="" s_pcheck="" s_ipquery="" s_dbip_lvl="" s_dbip_num=""
+    local s_ipapi_raw="" s_ipapi_pct="" s_ipapi_bar="" s_ipapi_risk_txt="" s_ipapi_color=""
+    local s_abuse="" s_ipqs=""
+    s_ip2loc=$(jq -r 'if .fraud_score == null then "" else (.fraud_score|tostring) end' "$f_ip2loc" 2>/dev/null)
     s_scam=$(jq -r '.score // ""' "$f_scam" 2>/dev/null)
     s_pcheck=$(jq -r --arg ip "$ip" '.[$ip].risk // ""' "$f_pcheck" 2>/dev/null)
     s_ipquery=$(jq -r '.risk.risk_score // ""' "$f_ipquery" 2>/dev/null)
-    [[ -f "${run_dir}/db_abuseipdb.json" ]] && s_abuse=$(jq -r '.data.abuseConfidenceScore // ""' "${run_dir}/db_abuseipdb.json" 2>/dev/null)
-    [[ -f "${run_dir}/db_ipqs.json" ]] && s_ipqs=$(jq -r '.fraud_score // ""' "${run_dir}/db_ipqs.json" 2>/dev/null)
+    s_dbip_lvl=$(jq -r '.threatLevel // ""' "$f_dbip" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    case "$s_dbip_lvl" in
+        low)    s_dbip_num="10" ;;
+        medium) s_dbip_num="50" ;;
+        high)   s_dbip_num="90" ;;
+        *)      s_dbip_lvl=""; s_dbip_num="" ;;
+    esac
 
-    # 风险因子矩阵（6 个独立源）
-    local cc_ii cc_iq cc_pc cc_sc cc_ia cc_i2
-    cc_ii=$(jq -r '.data.country // "N/A"' "$f_ipinfo" 2>/dev/null)
-    cc_iq=$(jq -r '.location.country_code // "N/A"' "$f_ipquery" 2>/dev/null)
-    cc_pc=$(jq -r --arg ip "$ip" '.[$ip].isocode // "N/A"' "$f_pcheck" 2>/dev/null)
-    cc_sc=$(jq -r '.country // "N/A"' "$f_scam" 2>/dev/null); [[ -z "$cc_sc" ]] && cc_sc="N/A"
-    cc_ia=$(jq -r '.countryCode // "N/A"' "$f_ipapi" 2>/dev/null)
+    if [[ -f "$f_ipapi_is" ]]; then
+        s_ipapi_raw=$(jq -r '.company.abuser_score // .asn.abuser_score // ""' "$f_ipapi_is" 2>/dev/null)
+        if [[ -n "$s_ipapi_raw" && "$s_ipapi_raw" != "null" ]]; then
+            local s_ipapi_num s_ipapi_lbl
+            s_ipapi_num=$(echo "$s_ipapi_raw" | awk '{print $1}')
+            s_ipapi_lbl=$(echo "$s_ipapi_raw" | awk -F'[()]' '{print $2}')
+            if [[ "$s_ipapi_num" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                s_ipapi_pct=$(awk -v n="$s_ipapi_num" 'BEGIN { printf "%.2f%%", n * 100 }')
+                s_ipapi_bar=$(awk -v n="$s_ipapi_num" 'BEGIN {
+                    v = n * 10000
+                    if (v <= 85) b = int(v * 33 / 85 + 0.5)
+                    else if (v <= 300) b = int(33 + (v - 85) * 33 / 215 + 0.5)
+                    else b = int(66 + (v - 300) * 34 / 9700 + 0.5)
+                    if (b < 0) b = 0
+                    if (b > 100) b = 100
+                    print b
+                }')
+                case "$s_ipapi_lbl" in
+                    "Very Low")  s_ipapi_color="$C_GREEN";  [[ "$LANG_CODE" == "en" ]] && s_ipapi_risk_txt="VeryLow"  || s_ipapi_risk_txt="极低风险" ;;
+                    "Low")       s_ipapi_color="$C_GREEN";  [[ "$LANG_CODE" == "en" ]] && s_ipapi_risk_txt="Low"      || s_ipapi_risk_txt="低风险" ;;
+                    "Elevated")  s_ipapi_color="$C_YELLOW"; [[ "$LANG_CODE" == "en" ]] && s_ipapi_risk_txt="Elevated" || s_ipapi_risk_txt="较高风险" ;;
+                    "High")      s_ipapi_color="$C_RED";    [[ "$LANG_CODE" == "en" ]] && s_ipapi_risk_txt="High"     || s_ipapi_risk_txt="高风险" ;;
+                    "Very High") s_ipapi_color="$C_RED";    [[ "$LANG_CODE" == "en" ]] && s_ipapi_risk_txt="VeryHigh" || s_ipapi_risk_txt="极高风险" ;;
+                esac
+            fi
+        fi
+    fi
+
+    [[ -f "$f_abuse" ]] && s_abuse=$(jq -r '.data.abuseConfidenceScore // ""' "$f_abuse" 2>/dev/null)
+    [[ -f "$f_ipqs" ]]  && s_ipqs=$(jq -r '.fraud_score // ""' "$f_ipqs" 2>/dev/null)
+
+    # 风险因子矩阵（8 大免Key直连源: IP2Loc / IPinfo / ipreg / Scamal / ProxyCh / IPQuery / IP-API / DB-IP）
+    local cc_i2 cc_ii cc_ir cc_sc cc_pc cc_iq cc_ia cc_db
     cc_i2=$(jq -r '.country_code // "N/A"' "$f_ip2loc" 2>/dev/null)
+    cc_ii=$(jq -r '.data.country // "N/A"' "$f_ipinfo" 2>/dev/null)
+    cc_ir=$(jq -r '.location.country.code // "N/A"' "$f_ipreg" 2>/dev/null)
+    cc_sc=$(jq -r '.country // "N/A"' "$f_scam" 2>/dev/null); [[ -z "$cc_sc" ]] && cc_sc="N/A"
+    cc_pc=$(jq -r --arg ip "$ip" '.[$ip].isocode // "N/A"' "$f_pcheck" 2>/dev/null)
+    cc_iq=$(jq -r '.location.country_code // "N/A"' "$f_ipquery" 2>/dev/null)
+    cc_ia=$(jq -r '.countryCode // "N/A"' "$f_ipapi" 2>/dev/null)
+    cc_db=$(jq -r '.countryCode // "N/A"' "$f_dbip" 2>/dev/null)
 
-    local px_ii px_iq px_pc px_sc px_ia px_i2
+    local px_i2 px_ii px_ir px_sc px_pc px_iq px_ia px_db
+    px_i2=$(jq -r 'if (.is_proxy == null and .proxy.is_public_proxy == null and .proxy.is_web_proxy == null) then "null" elif (.is_proxy == true or .proxy.is_public_proxy == true or .proxy.is_web_proxy == true or .proxy.is_residential_proxy == true) then "true" else "false" end' "$f_ip2loc" 2>/dev/null)
     px_ii=$(jq -r 'if .data.privacy.proxy == null then "null" else (.data.privacy.proxy|tostring) end' "$f_ipinfo" 2>/dev/null)
-    px_iq=$(jq -r 'if .risk.is_proxy == null then "null" else (.risk.is_proxy|tostring) end' "$f_ipquery" 2>/dev/null)
-    px_pc=$(jq -r --arg ip "$ip" '.[$ip].proxy // "null"' "$f_pcheck" 2>/dev/null)
+    px_ir=$(jq -r 'if (.security.is_proxy == null and .security.is_residential_proxy == null) then "null" elif (.security.is_proxy == true or .security.is_residential_proxy == true) then "true" else "false" end' "$f_ipreg" 2>/dev/null)
     px_sc=$(jq -r '.proxy // "null"' "$f_scam" 2>/dev/null)
+    px_pc=$(jq -r --arg ip "$ip" '.[$ip].proxy // "null"' "$f_pcheck" 2>/dev/null)
+    px_iq=$(jq -r 'if .risk.is_proxy == null then "null" else (.risk.is_proxy|tostring) end' "$f_ipquery" 2>/dev/null)
     px_ia=$(jq -r 'if .proxy == null then "null" else (.proxy|tostring) end' "$f_ipapi" 2>/dev/null)
-    px_i2=$(jq -r 'if .is_proxy == null then "null" else (.is_proxy|tostring) end' "$f_ip2loc" 2>/dev/null)
+    px_db=$(jq -r 'if .isProxy == null then "null" else (.isProxy|tostring) end' "$f_dbip" 2>/dev/null)
 
-    local vpn_ii vpn_iq vpn_pc vpn_sc
-    vpn_ii=$(jq -r 'if .data.privacy.vpn == null then "null" else (.data.privacy.vpn|tostring) end' "$f_ipinfo" 2>/dev/null)
-    vpn_iq=$(jq -r 'if .risk.is_vpn == null then "null" else (.risk.is_vpn|tostring) end' "$f_ipquery" 2>/dev/null)
-    vpn_pc="null"; [[ "$(echo "$t_pcheck" | tr '[:upper:]' '[:lower:]')" == "vpn" ]] && vpn_pc="true" || { [[ -n "$t_pcheck" ]] && vpn_pc="false"; }
-    vpn_sc=$(jq -r '.vpn // "null"' "$f_scam" 2>/dev/null)
-
-    local tor_ii tor_iq tor_sc
+    local tor_i2 tor_ii tor_ir tor_sc tor_iq
+    tor_i2=$(jq -r 'if .proxy.is_tor == null then "null" else (.proxy.is_tor|tostring) end' "$f_ip2loc" 2>/dev/null)
     tor_ii=$(jq -r 'if .data.privacy.tor == null then "null" else (.data.privacy.tor|tostring) end' "$f_ipinfo" 2>/dev/null)
-    tor_iq=$(jq -r 'if .risk.is_tor == null then "null" else (.risk.is_tor|tostring) end' "$f_ipquery" 2>/dev/null)
+    tor_ir=$(jq -r 'if (.security.is_tor == null and .security.is_tor_exit == null) then "null" elif (.security.is_tor == true or .security.is_tor_exit == true) then "true" else "false" end' "$f_ipreg" 2>/dev/null)
     tor_sc=$(jq -r '.tor // "null"' "$f_scam" 2>/dev/null)
+    tor_iq=$(jq -r 'if .risk.is_tor == null then "null" else (.risk.is_tor|tostring) end' "$f_ipquery" 2>/dev/null)
 
-    local srv_ii srv_iq srv_pc srv_sc srv_ia
+    local vpn_i2 vpn_ii vpn_ir vpn_sc vpn_pc vpn_iq
+    vpn_i2=$(jq -r 'if .proxy.is_vpn == null then "null" else (.proxy.is_vpn|tostring) end' "$f_ip2loc" 2>/dev/null)
+    vpn_ii=$(jq -r 'if .data.privacy.vpn == null then "null" else (.data.privacy.vpn|tostring) end' "$f_ipinfo" 2>/dev/null)
+    vpn_ir=$(jq -r 'if .security.is_vpn == null then "null" else (.security.is_vpn|tostring) end' "$f_ipreg" 2>/dev/null)
+    vpn_sc=$(jq -r '.vpn // "null"' "$f_scam" 2>/dev/null)
+    vpn_pc="null"; [[ "$(echo "$t_pcheck" | tr '[:upper:]' '[:lower:]')" == "vpn" ]] && vpn_pc="true" || { [[ -n "$t_pcheck" ]] && vpn_pc="false"; }
+    vpn_iq=$(jq -r 'if .risk.is_vpn == null then "null" else (.risk.is_vpn|tostring) end' "$f_ipquery" 2>/dev/null)
+
+    local srv_i2 srv_ii srv_ir srv_sc srv_pc srv_iq srv_ia
+    srv_i2=$(jq -r 'if .proxy.is_data_center == null then "null" else (.proxy.is_data_center|tostring) end' "$f_ip2loc" 2>/dev/null)
     srv_ii=$(jq -r 'if .data.privacy.hosting == null then "null" else (.data.privacy.hosting|tostring) end' "$f_ipinfo" 2>/dev/null)
-    srv_iq=$(jq -r 'if .risk.is_datacenter == null then "null" else (.risk.is_datacenter|tostring) end' "$f_ipquery" 2>/dev/null)
-    srv_pc="null"; [[ "$(echo "$t_pcheck" | tr '[:upper:]' '[:lower:]')" == *"hosting"* ]] && srv_pc="true" || { [[ -n "$t_pcheck" ]] && srv_pc="false"; }
+    srv_ir=$(jq -r 'if .security.is_cloud_provider == null then "null" else (.security.is_cloud_provider|tostring) end' "$f_ipreg" 2>/dev/null)
     srv_sc=$(jq -r '.server // "null"' "$f_scam" 2>/dev/null)
+    srv_pc="null"; [[ "$(echo "$t_pcheck" | tr '[:upper:]' '[:lower:]')" == *"hosting"* ]] && srv_pc="true" || { [[ -n "$t_pcheck" ]] && srv_pc="false"; }
+    srv_iq=$(jq -r 'if .risk.is_datacenter == null then "null" else (.risk.is_datacenter|tostring) end' "$f_ipquery" 2>/dev/null)
     srv_ia=$(jq -r 'if .hosting == null then "null" else (.hosting|tostring) end' "$f_ipapi" 2>/dev/null)
 
-    local mob_ii mob_iq mob_ia rob_sc
+    local abu_i2 abu_ir abu_sc
+    abu_i2=$(jq -r 'if .proxy.is_spammer == null then "null" else (.proxy.is_spammer|tostring) end' "$f_ip2loc" 2>/dev/null)
+    abu_ir=$(jq -r 'if (.security.is_abuser == null and .security.is_attacker == null and .security.is_threat == null) then "null" elif (.security.is_abuser == true or .security.is_attacker == true or .security.is_threat == true) then "true" else "false" end' "$f_ipreg" 2>/dev/null)
+    abu_sc=$(jq -r '.abuser // "null"' "$f_scam" 2>/dev/null)
+
+    local mob_i2 mob_ii mob_iq mob_ia
+    mob_i2="null"
+    if [[ -n "$t_ip2loc_use" && "$t_ip2loc_use" != "-" ]]; then
+        [[ "$t_ip2loc_use" == *"MOB"* ]] && mob_i2="true" || mob_i2="false"
+    fi
     mob_ii=$(jq -r 'if .data.is_mobile == null then "null" else (.data.is_mobile|tostring) end' "$f_ipinfo" 2>/dev/null)
     mob_iq=$(jq -r 'if .risk.is_mobile == null then "null" else (.risk.is_mobile|tostring) end' "$f_ipquery" 2>/dev/null)
     mob_ia=$(jq -r 'if .mobile == null then "null" else (.mobile|tostring) end' "$f_ipapi" 2>/dev/null)
+
+    local rob_i2 rob_sc rob_db
+    rob_i2=$(jq -r 'if (.proxy.is_web_crawler == null and .proxy.is_scanner == null and .proxy.is_botnet == null) then "null" elif (.proxy.is_web_crawler == true or .proxy.is_ai_crawler == true or .proxy.is_scanner == true or .proxy.is_botnet == true) then "true" else "false" end' "$f_ip2loc" 2>/dev/null)
     rob_sc=$(jq -r '.robot // "null"' "$f_scam" 2>/dev/null)
+    rob_db=$(jq -r 'if .isCrawler == null then "null" else (.isCrawler|tostring) end' "$f_dbip" 2>/dev/null)
+
+    # 可选扩展库风险因子（ipapi.is / AbuseIPDB / ipdata / IPQS）
+    local cc_is="N/A" px_is="null" tor_is="null" vpn_is="null" srv_is="null" abu_is="null" mob_is="null" rob_is="null"
+    local cc_ab="N/A" tor_ab="null" abu_ab="null"
+    local cc_id="N/A" px_id="null" tor_id="null" srv_id="null" abu_id="null"
+    local cc_qs="N/A" px_qs="null" tor_qs="null" vpn_qs="null" abu_qs="null" mob_qs="null" rob_qs="null"
+
+    if [[ -f "$f_ipapi_is" ]]; then
+        cc_is=$(jq -r '.location.country_code // "N/A"' "$f_ipapi_is" 2>/dev/null)
+        px_is=$(jq -r 'if .is_proxy == null then "null" else (.is_proxy|tostring) end' "$f_ipapi_is" 2>/dev/null)
+        tor_is=$(jq -r 'if .is_tor == null then "null" else (.is_tor|tostring) end' "$f_ipapi_is" 2>/dev/null)
+        vpn_is=$(jq -r 'if .is_vpn == null then "null" else (.is_vpn|tostring) end' "$f_ipapi_is" 2>/dev/null)
+        srv_is=$(jq -r 'if .is_datacenter == null then "null" else (.is_datacenter|tostring) end' "$f_ipapi_is" 2>/dev/null)
+        abu_is=$(jq -r 'if .is_abuser == null then "null" else (.is_abuser|tostring) end' "$f_ipapi_is" 2>/dev/null)
+        mob_is=$(jq -r 'if .is_mobile == null then "null" else (.is_mobile|tostring) end' "$f_ipapi_is" 2>/dev/null)
+        rob_is=$(jq -r 'if .is_crawler == null then "null" else (.is_crawler|tostring) end' "$f_ipapi_is" 2>/dev/null)
+    fi
+    if [[ -f "$f_abuse" ]]; then
+        cc_ab=$(jq -r '.data.countryCode // "N/A"' "$f_abuse" 2>/dev/null)
+        tor_ab=$(jq -r 'if .data.isTor == null then "null" else (.data.isTor|tostring) end' "$f_abuse" 2>/dev/null)
+        abu_ab=$(jq -r 'if .data.abuseConfidenceScore == null then "null" elif (.data.abuseConfidenceScore >= 10) then "true" else "false" end' "$f_abuse" 2>/dev/null)
+    fi
+    if [[ -f "$f_ipdata" ]]; then
+        cc_id=$(jq -r '.country_code // "N/A"' "$f_ipdata" 2>/dev/null)
+        px_id=$(jq -r 'if .threat.is_proxy == null then "null" else (.threat.is_proxy|tostring) end' "$f_ipdata" 2>/dev/null)
+        tor_id=$(jq -r 'if .threat.is_tor == null then "null" else (.threat.is_tor|tostring) end' "$f_ipdata" 2>/dev/null)
+        srv_id=$(jq -r 'if .threat.is_datacenter == null then "null" else (.threat.is_datacenter|tostring) end' "$f_ipdata" 2>/dev/null)
+        abu_id=$(jq -r 'if (.threat.is_threat == null and .threat.is_known_abuser == null and .threat.is_known_attacker == null) then "null" elif (.threat.is_threat == true or .threat.is_known_abuser == true or .threat.is_known_attacker == true) then "true" else "false" end' "$f_ipdata" 2>/dev/null)
+    fi
+    if [[ -f "$f_ipqs" ]]; then
+        cc_qs=$(jq -r '.country_code // "N/A"' "$f_ipqs" 2>/dev/null)
+        px_qs=$(jq -r 'if .proxy == null then "null" else (.proxy|tostring) end' "$f_ipqs" 2>/dev/null)
+        tor_qs=$(jq -r 'if .tor == null then "null" else (.tor|tostring) end' "$f_ipqs" 2>/dev/null)
+        vpn_qs=$(jq -r 'if .vpn == null then "null" else (.vpn|tostring) end' "$f_ipqs" 2>/dev/null)
+        abu_qs=$(jq -r 'if .recent_abuse == null then "null" else (.recent_abuse|tostring) end' "$f_ipqs" 2>/dev/null)
+        mob_qs=$(jq -r 'if .mobile == null then "null" else (.mobile|tostring) end' "$f_ipqs" 2>/dev/null)
+        rob_qs=$(jq -r 'if .bot_status == null then "null" else (.bot_status|tostring) end' "$f_ipqs" 2>/dev/null)
+    fi
+
+    # StopForumSpam 垃圾源情报
+    local sfs_appears=0 sfs_freq=0 sfs_conf="0"
+    sfs_appears=$(jq -r '.ip.appears // 0' "$f_sfs" 2>/dev/null || echo 0)
+    sfs_freq=$(jq -r '.ip.frequency // 0' "$f_sfs" 2>/dev/null || echo 0)
+    sfs_conf=$(jq -r '.ip.confidence // 0' "$f_sfs" 2>/dev/null || echo 0)
+    [[ ! "$sfs_appears" =~ ^[0-9]+$ ]] && sfs_appears=0
+    [[ ! "$sfs_freq" =~ ^[0-9]+$ ]] && sfs_freq=0
 
     # DNSBL 结果
     local dnsbl_total=0 dnsbl_clean=0 dnsbl_hits=0 dnsbl_mode="N/A" dnsbl_hit_names=""
@@ -2388,9 +3238,9 @@ run_single_ip_check() {
         IFS='|' read -r mail_local mail_ok_cnt mail_ok_list mail_fail_list < "${run_dir}/mail_summary.txt"
     fi
 
-    # 计算综合风险分（加权平均可用风险源 + DNSBL 命中惩罚）
+    # 计算综合风险分（平均全部可用风险分 + DNSBL 命中惩罚 + StopForumSpam 滥用惩罚）
     local score_sum=0 score_cnt=0 sc
-    for sc in "$s_scam" "$s_pcheck" "$s_ipquery" "$s_abuse" "$s_ipqs"; do
+    for sc in "$s_ip2loc" "$s_scam" "$s_pcheck" "$s_ipquery" "$s_dbip_num" "$s_ipapi_bar" "$s_abuse" "$s_ipqs"; do
         if [[ "$sc" =~ ^[0-9]+$ ]]; then
             score_sum=$((score_sum + sc))
             score_cnt=$((score_cnt + 1))
@@ -2402,20 +3252,54 @@ run_single_ip_check() {
     fi
     if (( dnsbl_hits > 0 )); then
         avg_score=$((avg_score + dnsbl_hits * 15))
-        (( avg_score > 100 )) && avg_score=100
     fi
+    if (( sfs_appears > 0 )); then
+        avg_score=$((avg_score + 15))
+    fi
+    (( avg_score > 100 )) && avg_score=100
 
     # 原生 vs 广播判定
-    local geo_type_code="unknown" geo_type_label=""
+    local geo_type_code="unknown"
     if [[ -n "$country_code" && -n "$reg_country" ]]; then
         if [[ "$country_code" == "$reg_country" ]]; then
             geo_type_code="native"
-            [[ "$LANG_CODE" == "en" ]] && geo_type_label="${BG_GREEN}${C_BLACK} Native IP ${C_RESET}" || geo_type_label="${BG_GREEN}${C_BLACK} 原生 IP ${C_RESET}"
         else
             geo_type_code="broadcast"
-            [[ "$LANG_CODE" == "en" ]] && geo_type_label="${BG_YELLOW}${C_BLACK} Broadcast IP ${C_RESET}" || geo_type_label="${BG_YELLOW}${C_BLACK} 广播 IP ${C_RESET}"
         fi
     fi
+
+    # 本地化国家/洲际显示字符串
+    local continent_name="" country_disp="" reg_country_disp=""
+    [[ -n "$continent_code" ]] && continent_name=$(lookup_continent_name "$continent_code")
+    if [[ -n "$country_code" ]]; then
+        country_disp=$(format_country_display "$country_code" "$country_name")
+        if [[ -n "$continent_code" && -n "$continent_name" ]]; then
+            if [[ "$LANG_CODE" == "en" ]]; then
+                country_disp="${country_disp}, [${continent_code}] ${continent_name}"
+            else
+                country_disp="${country_disp}，[${continent_code}]${continent_name}"
+            fi
+        fi
+    else
+        country_disp="N/A"
+    fi
+    if [[ -n "$reg_country" ]]; then
+        reg_country_disp=$(format_country_display "$reg_country")
+    fi
+
+    # 城市完整组合（州/省, 城市, 邮编）
+    local city_disp=""
+    if [[ -n "$region_name" && -n "$city_name" && "$region_name" != "$city_name" ]]; then
+        city_disp="${region_name}, ${city_name}"
+    elif [[ -n "$city_name" ]]; then
+        city_disp="$city_name"
+    elif [[ -n "$region_name" ]]; then
+        city_disp="$region_name"
+    fi
+    if [[ -n "$postal_code" ]]; then
+        [[ -n "$city_disp" ]] && city_disp="${city_disp}, ${postal_code}" || city_disp="$postal_code"
+    fi
+    [[ -z "$city_disp" ]] && city_disp="N/A"
 
     # 读取流媒体/AI 结果
     local m_chatgpt_s="" m_chatgpt_r="" m_claude_s="" m_claude_r="" m_gemini_s="" m_gemini_r=""
@@ -2440,80 +3324,7 @@ run_single_ip_check() {
         now_time=$(TZ="Asia/Shanghai" date +"%Y-%m-%d %H:%M:%S CST" 2>/dev/null || date +"%Y-%m-%d %H:%M:%S")
     fi
 
-    # ---------------- 构建结构化 JSON ----------------
-    local report_json
-    report_json=$(jq -n \
-        --arg ver "v${VERSION}" \
-        --arg time "$now_time" \
-        --arg ip "$display_ip" \
-        --arg stack "IPv${stack}" \
-        --arg mode "$TARGET_MODE" \
-        --arg asn "${asn:-N/A}" \
-        --arg org "${org:-N/A}" \
-        --arg isp "${isp:-N/A}" \
-        --arg rdns "${rdns:-}" \
-        --arg cc "${country_code:-N/A}" \
-        --arg cname "${country_name:-N/A}" \
-        --arg regcc "${reg_country:-N/A}" \
-        --arg region "${region_name:-}" \
-        --arg city "${city_name:-}" \
-        --arg tz "${timezone:-N/A}" \
-        --arg geotype "$geo_type_code" \
-        --arg t_ii_u "${t_ipinfo_use:-N/A}" \
-        --arg t_ii_c "${t_ipinfo_com:-N/A}" \
-        --arg t_pc "${t_pcheck:-N/A}" \
-        --arg s_scam "${s_scam:-}" \
-        --arg s_pc "${s_pcheck:-}" \
-        --arg s_iq "${s_ipquery:-}" \
-        --arg s_ab "${s_abuse:-}" \
-        --arg s_ipqs "${s_ipqs:-}" \
-        --argjson avg "$avg_score" \
-        --arg px_ii "$px_ii" --arg px_iq "$px_iq" --arg px_pc "$px_pc" --arg px_sc "$px_sc" --arg px_ia "$px_ia" --arg px_i2 "$px_i2" \
-        --arg vpn_ii "$vpn_ii" --arg vpn_iq "$vpn_iq" --arg vpn_pc "$vpn_pc" --arg vpn_sc "$vpn_sc" \
-        --arg tor_ii "$tor_ii" --arg tor_iq "$tor_iq" --arg tor_sc "$tor_sc" \
-        --arg srv_ii "$srv_ii" --arg srv_iq "$srv_iq" --arg srv_pc "$srv_pc" --arg srv_sc "$srv_sc" --arg srv_ia "$srv_ia" \
-        --arg mob_ii "$mob_ii" --arg mob_iq "$mob_iq" --arg mob_ia "$mob_ia" \
-        --arg rob_sc "$rob_sc" \
-        --arg cg_s "$m_chatgpt_s" --arg cg_r "$m_chatgpt_r" \
-        --arg cl_s "$m_claude_s" --arg cl_r "$m_claude_r" \
-        --arg gm_s "$m_gemini_s" --arg gm_r "$m_gemini_r" \
-        --arg nf_s "$m_netflix_s" --arg nf_r "$m_netflix_r" \
-        --arg ds_s "$m_disney_s" --arg ds_r "$m_disney_r" \
-        --arg yt_s "$m_youtube_s" --arg yt_r "$m_youtube_r" \
-        --arg tt_s "$m_tiktok_s" --arg tt_r "$m_tiktok_r" \
-        --arg pv_s "$m_prime_s" --arg pv_r "$m_prime_r" \
-        --arg rd_s "$m_reddit_s" --arg rd_r "$m_reddit_r" \
-        --arg mail_loc "$mail_local" --arg mail_ok "$mail_ok_list" --arg mail_fail "$mail_fail_list" \
-        --argjson d_tot "$dnsbl_total" --argjson d_cln "$dnsbl_clean" --argjson d_hit "$dnsbl_hits" --arg d_mode "$dnsbl_mode" --arg d_names "$dnsbl_hit_names" \
-        '{
-            meta: {tool: "IPzhiliang", version: $ver, time: $time, ip: $ip, stack: $stack, mode: $mode, privacy_upload: false},
-            basic: {asn: $asn, organization: $org, isp: $isp, rdns: $rdns, country_code: $cc, country: $cname, registered_country: $regcc, region: $region, city: $city, timezone: $tz, ip_origin: $geotype},
-            type: {ipinfo_usage: $t_ii_u, ipinfo_company: $t_ii_c, proxycheck: $t_pc},
-            risk_score: {composite: $avg, scamalytics: $s_scam, proxycheck: $s_pc, ipquery: $s_iq, abuseipdb: $s_ab, ipqs: $s_ipqs},
-            risk_factors: {
-                proxy: {ipinfo: $px_ii, ipquery: $px_iq, proxycheck: $px_pc, scamalytics: $px_sc, ipapi: $px_ia, ip2location: $px_i2},
-                vpn: {ipinfo: $vpn_ii, ipquery: $vpn_iq, proxycheck: $vpn_pc, scamalytics: $vpn_sc},
-                tor: {ipinfo: $tor_ii, ipquery: $tor_iq, scamalytics: $tor_sc},
-                server: {ipinfo: $srv_ii, ipquery: $srv_iq, proxycheck: $srv_pc, scamalytics: $srv_sc, ipapi: $srv_ia},
-                mobile: {ipinfo: $mob_ii, ipquery: $mob_iq, ipapi: $mob_ia},
-                robot: {scamalytics: $rob_sc}
-            },
-            unlock: {
-                ChatGPT: {status: $cg_s, region: $cg_r},
-                Claude: {status: $cl_s, region: $cl_r},
-                Gemini: {status: $gm_s, region: $gm_r},
-                Netflix: {status: $nf_s, region: $nf_r},
-                DisneyPlus: {status: $ds_s, region: $ds_r},
-                YouTube: {status: $yt_s, region: $yt_r},
-                TikTok: {status: $tt_s, region: $tt_r},
-                PrimeVideo: {status: $pv_s, region: $pv_r},
-                Reddit: {status: $rd_s, region: $rd_r}
-            },
-            mail: {port25_outbound: $mail_loc, reachable_providers: $mail_ok, blocked_providers: $mail_fail},
-            dnsbl: {method: $d_mode, total: $d_tot, clean: $d_cln, blacklisted: $d_hit, hits: $d_names}
-        }')
-
-    # ---------------- 构建经典 72 列终端彩色报告 ----------------
+    # IPQuery / IP-API 推导使用类型
     local t_ipquery_use="unknown" t_ipapi_use="unknown"
     if [[ "$mob_iq" == "true" ]]; then
         t_ipquery_use="mobile"
@@ -2537,12 +3348,120 @@ run_single_ip_check() {
         t_ipapi_use="isp"
     fi
 
+    # ---------------- 构建结构化 JSON ----------------
+    local report_json
+    report_json=$(jq -n \
+        --arg ver "v${VERSION}" \
+        --arg time "$now_time" \
+        --arg ip "$display_ip" \
+        --arg stack "IPv${stack}" \
+        --arg mode "$TARGET_MODE" \
+        --arg asn "${asn:-N/A}" \
+        --arg org "${org:-N/A}" \
+        --arg isp "${isp:-N/A}" \
+        --arg cidr "${cidr_disp:-}" \
+        --arg rir "${rir:-}" \
+        --arg rdns "${rdns:-}" \
+        --arg lat "${lat:-}" \
+        --arg lon "${lon:-}" \
+        --arg dms "${dms:-}" \
+        --arg map_url "${map_url:-}" \
+        --arg cc "${country_code:-N/A}" \
+        --arg cname "${country_name:-N/A}" \
+        --arg cont_cc "${continent_code:-}" \
+        --arg cont_name "${continent_name:-}" \
+        --arg regcc "${reg_country:-N/A}" \
+        --arg region "${region_name:-}" \
+        --arg city "${city_name:-}" \
+        --arg postal "${postal_code:-}" \
+        --arg tz "${timezone:-N/A}" \
+        --arg geotype "$geo_type_code" \
+        --arg anycast "$is_anycast" \
+        --arg t_ii_u "${t_ipinfo_use:-N/A}" --arg t_ii_c "${t_ipinfo_com:-N/A}" \
+        --arg t_ir_u "${t_ipreg_use:-N/A}" --arg t_ir_c "${t_ipreg_com:-N/A}" \
+        --arg t_i2_u "${t_ip2loc_use:-N/A}" --arg t_i2_c "${t_ip2loc_com:-N/A}" \
+        --arg t_pc "${t_pcheck:-N/A}" --arg t_iq "${t_ipquery_use:-N/A}" --arg t_ia "${t_ipapi_use:-N/A}" \
+        --arg t_is_u "${t_ipapi_is_use:-}" --arg t_is_c "${t_ipapi_is_com:-}" --arg t_ab_u "${t_abuse_use:-}" \
+        --arg s_i2 "${s_ip2loc:-}" --arg s_scam "${s_scam:-}" --arg s_pc "${s_pcheck:-}" --arg s_iq "${s_ipquery:-}" \
+        --arg s_dbip "${s_dbip_lvl:-}" --arg s_is "${s_ipapi_raw:-}" --arg s_ab "${s_abuse:-}" --arg s_ipqs "${s_ipqs:-}" \
+        --argjson avg "$avg_score" \
+        --arg cc_i2 "$cc_i2" --arg cc_ii "$cc_ii" --arg cc_ir "$cc_ir" --arg cc_sc "$cc_sc" --arg cc_pc "$cc_pc" --arg cc_iq "$cc_iq" --arg cc_ia "$cc_ia" --arg cc_db "$cc_db" \
+        --arg cc_is "$cc_is" --arg cc_ab "$cc_ab" --arg cc_id "$cc_id" --arg cc_qs "$cc_qs" \
+        --arg px_i2 "$px_i2" --arg px_ii "$px_ii" --arg px_ir "$px_ir" --arg px_sc "$px_sc" --arg px_pc "$px_pc" --arg px_iq "$px_iq" --arg px_ia "$px_ia" --arg px_db "$px_db" \
+        --arg px_is "$px_is" --arg px_id "$px_id" --arg px_qs "$px_qs" \
+        --arg tor_i2 "$tor_i2" --arg tor_ii "$tor_ii" --arg tor_ir "$tor_ir" --arg tor_sc "$tor_sc" --arg tor_iq "$tor_iq" \
+        --arg tor_is "$tor_is" --arg tor_ab "$tor_ab" --arg tor_id "$tor_id" --arg tor_qs "$tor_qs" \
+        --arg vpn_i2 "$vpn_i2" --arg vpn_ii "$vpn_ii" --arg vpn_ir "$vpn_ir" --arg vpn_sc "$vpn_sc" --arg vpn_pc "$vpn_pc" --arg vpn_iq "$vpn_iq" \
+        --arg vpn_is "$vpn_is" --arg vpn_qs "$vpn_qs" \
+        --arg srv_i2 "$srv_i2" --arg srv_ii "$srv_ii" --arg srv_ir "$srv_ir" --arg srv_sc "$srv_sc" --arg srv_pc "$srv_pc" --arg srv_iq "$srv_iq" --arg srv_ia "$srv_ia" \
+        --arg srv_is "$srv_is" --arg srv_id "$srv_id" \
+        --arg abu_i2 "$abu_i2" --arg abu_ir "$abu_ir" --arg abu_sc "$abu_sc" --arg abu_is "$abu_is" --arg abu_ab "$abu_ab" --arg abu_id "$abu_id" --arg abu_qs "$abu_qs" \
+        --arg mob_i2 "$mob_i2" --arg mob_ii "$mob_ii" --arg mob_iq "$mob_iq" --arg mob_ia "$mob_ia" --arg mob_is "$mob_is" --arg mob_qs "$mob_qs" \
+        --arg rob_i2 "$rob_i2" --arg rob_sc "$rob_sc" --arg rob_db "$rob_db" --arg rob_is "$rob_is" --arg rob_qs "$rob_qs" \
+        --argjson sfs_app "$sfs_appears" --argjson sfs_frq "$sfs_freq" --arg sfs_cnf "$sfs_conf" \
+        --arg cg_s "$m_chatgpt_s" --arg cg_r "$m_chatgpt_r" \
+        --arg cl_s "$m_claude_s" --arg cl_r "$m_claude_r" \
+        --arg gm_s "$m_gemini_s" --arg gm_r "$m_gemini_r" \
+        --arg nf_s "$m_netflix_s" --arg nf_r "$m_netflix_r" \
+        --arg ds_s "$m_disney_s" --arg ds_r "$m_disney_r" \
+        --arg yt_s "$m_youtube_s" --arg yt_r "$m_youtube_r" \
+        --arg tt_s "$m_tiktok_s" --arg tt_r "$m_tiktok_r" \
+        --arg pv_s "$m_prime_s" --arg pv_r "$m_prime_r" \
+        --arg rd_s "$m_reddit_s" --arg rd_r "$m_reddit_r" \
+        --arg mail_loc "$mail_local" --arg mail_ok "$mail_ok_list" --arg mail_fail "$mail_fail_list" \
+        --argjson d_tot "$dnsbl_total" --argjson d_cln "$dnsbl_clean" --argjson d_hit "$dnsbl_hits" --arg d_mode "$dnsbl_mode" --arg d_names "$dnsbl_hit_names" \
+        '{
+            meta: {tool: "IPzhiliang", version: $ver, time: $time, ip: $ip, stack: $stack, mode: $mode, privacy_upload: false},
+            basic: {
+                asn: $asn, organization: $org, isp: $isp, cidr: $cidr, rir: $rir, rdns: $rdns,
+                latitude: $lat, longitude: $lon, dms: $dms, map: $map_url,
+                country_code: $cc, country: $cname, continent_code: $cont_cc, continent: $cont_name,
+                registered_country: $regcc, region: $region, city: $city, postal: $postal,
+                timezone: $tz, ip_origin: $geotype, anycast: ($anycast == "true")
+            },
+            type: {
+                ipinfo_usage: $t_ii_u, ipinfo_company: $t_ii_c,
+                ipregistry_usage: $t_ir_u, ipregistry_company: $t_ir_c,
+                ip2location_usage: $t_i2_u, ip2location_company: $t_i2_c,
+                proxycheck: $t_pc, ipquery: $t_iq, ipapi_com: $t_ia,
+                ipapi_is_usage: $t_is_u, ipapi_is_company: $t_is_c, abuseipdb: $t_ab_u
+            },
+            risk_score: {
+                composite: $avg, ip2location: $s_i2, scamalytics: $s_scam, proxycheck: $s_pc,
+                ipquery: $s_iq, dbip: $s_dbip, ipapi_is: $s_is, abuseipdb: $s_ab, ipqs: $s_ipqs
+            },
+            risk_factors: {
+                country: {ip2location: $cc_i2, ipinfo: $cc_ii, ipregistry: $cc_ir, scamalytics: $cc_sc, proxycheck: $cc_pc, ipquery: $cc_iq, ipapi_com: $cc_ia, dbip: $cc_db, ipapi_is: $cc_is, abuseipdb: $cc_ab, ipdata: $cc_id, ipqs: $cc_qs},
+                proxy: {ip2location: $px_i2, ipinfo: $px_ii, ipregistry: $px_ir, scamalytics: $px_sc, proxycheck: $px_pc, ipquery: $px_iq, ipapi_com: $px_ia, dbip: $px_db, ipapi_is: $px_is, ipdata: $px_id, ipqs: $px_qs},
+                tor: {ip2location: $tor_i2, ipinfo: $tor_ii, ipregistry: $tor_ir, scamalytics: $tor_sc, ipquery: $tor_iq, ipapi_is: $tor_is, abuseipdb: $tor_ab, ipdata: $tor_id, ipqs: $tor_qs},
+                vpn: {ip2location: $vpn_i2, ipinfo: $vpn_ii, ipregistry: $vpn_ir, scamalytics: $vpn_sc, proxycheck: $vpn_pc, ipquery: $vpn_iq, ipapi_is: $vpn_is, ipqs: $vpn_qs},
+                server: {ip2location: $srv_i2, ipinfo: $srv_ii, ipregistry: $srv_ir, scamalytics: $srv_sc, proxycheck: $srv_pc, ipquery: $srv_iq, ipapi_com: $srv_ia, ipapi_is: $srv_is, ipdata: $srv_id},
+                abuser: {ip2location: $abu_i2, ipregistry: $abu_ir, scamalytics: $abu_sc, ipapi_is: $abu_is, abuseipdb: $abu_ab, ipdata: $abu_id, ipqs: $abu_qs},
+                mobile: {ip2location: $mob_i2, ipinfo: $mob_ii, ipquery: $mob_iq, ipapi_com: $mob_ia, ipapi_is: $mob_is, ipqs: $mob_qs},
+                robot: {ip2location: $rob_i2, scamalytics: $rob_sc, dbip: $rob_db, ipapi_is: $rob_is, ipqs: $rob_qs},
+                stopforumspam: {appears: $sfs_app, frequency: $sfs_frq, confidence: $sfs_cnf}
+            },
+            unlock: {
+                ChatGPT: {status: $cg_s, region: $cg_r},
+                Claude: {status: $cl_s, region: $cl_r},
+                Gemini: {status: $gm_s, region: $gm_r},
+                Netflix: {status: $nf_s, region: $nf_r},
+                DisneyPlus: {status: $ds_s, region: $ds_r},
+                YouTube: {status: $yt_s, region: $yt_r},
+                TikTok: {status: $tt_s, region: $tt_r},
+                PrimeVideo: {status: $pv_s, region: $pv_r},
+                Reddit: {status: $rd_s, region: $rd_r}
+            },
+            mail: {port25_outbound: $mail_loc, reachable_providers: $mail_ok, blocked_providers: $mail_fail},
+            dnsbl: {method: $d_mode, total: $d_tot, clean: $d_cln, blacklisted: $d_hit, hits: $d_names}
+        }')
+
+    # ---------------- 构建经典 72 列终端彩色报告 ----------------
     local report_ansi_file="${run_dir}/report.ansi"
     {
         local hash_line="########################################################################"
         local eq_line="========================================================================"
         local repo_url="https://github.com/imthnio/IPzhiliang"
-        local one_liner="bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/run.sh)"
 
         echo -e "${hash_line}"
         if [[ "$LANG_CODE" == "en" ]]; then
@@ -2563,24 +3482,39 @@ run_single_ip_check() {
         fi
         echo -e "${hash_line}"
 
-        # 一、基础信息
-        local city_disp=""
-        if [[ -n "$region_name" && -n "$city_name" && "$region_name" != "$city_name" ]]; then
-            city_disp="${region_name}, ${city_name}"
-        elif [[ -n "$city_name" ]]; then
-            city_disp="$city_name"
-        elif [[ -n "$region_name" ]]; then
-            city_disp="$region_name"
+        # 一、基础信息（完整版：ASN / 组织 / 运营商 / 网段路由 / 反向解析 / DMS 坐标 / 地图 / 城市邮编 / 使用地+洲际 / 注册地 / 时区 / 原生与任播）
+        local route_disp=""
+        if [[ -n "$cidr_disp" && -n "$rir" ]]; then
+            route_disp="${cidr_disp} (${rir})"
+        elif [[ -n "$cidr_disp" ]]; then
+            route_disp="$cidr_disp"
+        elif [[ -n "$rir" ]]; then
+            route_disp="$rir"
+        fi
+
+        local org_lc isp_lc show_isp=0
+        org_lc=$(echo "${org:-}" | tr '[:upper:]' '[:lower:]')
+        isp_lc=$(echo "${isp:-}" | tr '[:upper:]' '[:lower:]')
+        [[ -n "$isp" && "$isp_lc" != "$org_lc" ]] && show_isp=1
+
+        local basic_src_en="Multi-Source Consensus" basic_src_cn="多源融合数据库"
+        if [[ $has_maxmind -eq 1 ]]; then
+            basic_src_en="MaxMind + Multi-Source"
+            basic_src_cn="MaxMind + 多源融合数据库"
         fi
 
         if [[ "$LANG_CODE" == "en" ]]; then
-            echo -e "1. Basic Information (${C_ITALIC}Multi-Source Consensus${C_RESET})"
-            echo -e "${C_CYAN}ASN:                    ${C_GREEN}${asn:-N/A}${C_RESET}"
+            echo -e "1. Basic Information (${C_ITALIC}${basic_src_en}${C_RESET})"
+            echo -e "${C_CYAN}ASN:                    ${C_GREEN}${asn:-Not Assigned}${C_RESET}"
             echo -e "${C_CYAN}Organization:           ${C_GREEN}${org:-N/A}${C_RESET}"
+            [[ $show_isp -eq 1 ]] && echo -e "${C_CYAN}ISP:                    ${C_GREEN}${isp}${C_RESET}"
+            [[ -n "$route_disp" ]] && echo -e "${C_CYAN}Route / RIR:            ${C_GREEN}${route_disp}${C_RESET}"
             [[ -n "$rdns" ]] && echo -e "${C_CYAN}rDNS:                   ${C_GREEN}${rdns}${C_RESET}"
-            [[ -n "$city_disp" ]] && echo -e "${C_CYAN}City:                   ${C_GREEN}${city_disp}${C_RESET}"
-            echo -e "${C_CYAN}Actual Region:          ${C_GREEN}[${country_code:-N/A}] ${country_name:-N/A}${C_RESET}"
-            [[ -n "$reg_country" ]] && echo -e "${C_CYAN}Registered Region:      ${C_GREEN}[${reg_country}]${C_RESET}"
+            [[ -n "$dms" ]] && echo -e "${C_CYAN}Location:               ${C_GREEN}${dms}${C_RESET}"
+            [[ -n "$map_url" ]] && echo -e "${C_CYAN}Map:                    ${C_UNDERLINE}${C_GREEN}${map_url}${C_RESET}"
+            echo -e "${C_CYAN}City:                   ${C_GREEN}${city_disp}${C_RESET}"
+            echo -e "${C_CYAN}Actual Region:          ${C_GREEN}${country_disp}${C_RESET}"
+            [[ -n "$reg_country_disp" ]] && echo -e "${C_CYAN}Registered Region:      ${C_GREEN}${reg_country_disp}${C_RESET}"
             echo -e "${C_CYAN}Time Zone:              ${C_GREEN}${timezone:-N/A}${C_RESET}"
             if [[ -n "$country_code" && -n "$reg_country" ]]; then
                 if [[ "$country_code" == "$reg_country" ]]; then
@@ -2591,13 +3525,17 @@ run_single_ip_check() {
             fi
             [[ "$is_anycast" == "true" ]] && echo -e "${C_CYAN}Routing:                ${C_YELLOW}Anycast${C_RESET}"
         else
-            echo -e "一、基础信息（${C_ITALIC}多源融合数据库${C_RESET}）"
+            echo -e "一、基础信息（${C_ITALIC}${basic_src_cn}${C_RESET}）"
             echo -e "${C_CYAN}自治系统号：            ${C_GREEN}${asn:-未分配}${C_RESET}"
             echo -e "${C_CYAN}组织：                  ${C_GREEN}${org:-N/A}${C_RESET}"
+            [[ $show_isp -eq 1 ]] && echo -e "${C_CYAN}运营商：                ${C_GREEN}${isp}${C_RESET}"
+            [[ -n "$route_disp" ]] && echo -e "${C_CYAN}网段路由：              ${C_GREEN}${route_disp}${C_RESET}"
             [[ -n "$rdns" ]] && echo -e "${C_CYAN}反向解析：              ${C_GREEN}${rdns}${C_RESET}"
-            [[ -n "$city_disp" ]] && echo -e "${C_CYAN}城市：                  ${C_GREEN}${city_disp}${C_RESET}"
-            echo -e "${C_CYAN}使用地：                ${C_GREEN}[${country_code:-N/A}] ${country_name:-N/A}${C_RESET}"
-            [[ -n "$reg_country" ]] && echo -e "${C_CYAN}注册地：                ${C_GREEN}[${reg_country}]${C_RESET}"
+            [[ -n "$dms" ]] && echo -e "${C_CYAN}坐标：                  ${C_GREEN}${dms}${C_RESET}"
+            [[ -n "$map_url" ]] && echo -e "${C_CYAN}地图：                  ${C_UNDERLINE}${C_GREEN}${map_url}${C_RESET}"
+            echo -e "${C_CYAN}城市：                  ${C_GREEN}${city_disp}${C_RESET}"
+            echo -e "${C_CYAN}使用地：                ${C_GREEN}${country_disp}${C_RESET}"
+            [[ -n "$reg_country_disp" ]] && echo -e "${C_CYAN}注册地：                ${C_GREEN}${reg_country_disp}${C_RESET}"
             echo -e "${C_CYAN}时区：                  ${C_GREEN}${timezone:-N/A}${C_RESET}"
             if [[ -n "$country_code" && -n "$reg_country" ]]; then
                 if [[ "$country_code" == "$reg_country" ]]; then
@@ -2609,61 +3547,171 @@ run_single_ip_check() {
             [[ "$is_anycast" == "true" ]] && echo -e "${C_CYAN}网络属性：              ${C_YELLOW}Anycast (任播网络)${C_RESET}"
         fi
 
-        # 二、IP类型属性
+        # 二、IP类型属性（6 大免Key直连库，总宽 10 + 6*10 = 70 <= 72 列 + 可选扩展库子行）
         if [[ "$LANG_CODE" == "en" ]]; then
             echo -e "2. IP Type"
-            echo -e "${C_CYAN}Database:   ${C_RESET}${C_ITALIC}  IPinfo    ProxyCheck    IPQuery     IP-API  ${C_RESET}"
-            printf "${C_CYAN}Usage:      ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_use")" "$(render_type_cell "$t_pcheck")" "$(render_type_cell "$t_ipquery_use")" "$(render_type_cell "$t_ipapi_use")"
-            printf "${C_CYAN}Company:    ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_com")" "$(render_type_cell "")" "$(render_type_cell "")" "$(render_type_cell "")"
+            echo -e "${C_CYAN}Database: ${C_RESET}${C_ITALIC}  IPinfo  ipregistry  IP2Loc  ProxyCheck  IPQuery   IP-API  ${C_RESET}"
+            printf "${C_CYAN}Usage:    ${C_RESET}%b%b%b%b%b%b\n" \
+                "$(render_type_cell "$t_ipinfo_use")" "$(render_type_cell "$t_ipreg_use")" "$(render_type_cell "$t_ip2loc_use")" \
+                "$(render_type_cell "$t_pcheck")" "$(render_type_cell "$t_ipquery_use")" "$(render_type_cell "$t_ipapi_use")"
+            printf "${C_CYAN}Company:  ${C_RESET}%b%b%b%b%b%b\n" \
+                "$(render_type_cell "$t_ipinfo_com")" "$(render_type_cell "$t_ipreg_com")" "$(render_type_cell "$t_ip2loc_com")" \
+                "$(render_type_cell "")" "$(render_type_cell "")" "$(render_type_cell "")"
         else
             echo -e "二、IP类型属性"
-            echo -e "${C_CYAN}数据库：    ${C_RESET}${C_ITALIC}  IPinfo    ProxyCheck    IPQuery     IP-API  ${C_RESET}"
-            printf "${C_CYAN}使用类型：  ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_use")" "$(render_type_cell "$t_pcheck")" "$(render_type_cell "$t_ipquery_use")" "$(render_type_cell "$t_ipapi_use")"
-            printf "${C_CYAN}公司类型：  ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_com")" "$(render_type_cell "")" "$(render_type_cell "")" "$(render_type_cell "")"
+            echo -e "${C_CYAN}数据库：  ${C_RESET}${C_ITALIC}  IPinfo  ipregistry  IP2Loc  ProxyCheck  IPQuery   IP-API  ${C_RESET}"
+            printf "${C_CYAN}使用类型：${C_RESET}%b%b%b%b%b%b\n" \
+                "$(render_type_cell "$t_ipinfo_use")" "$(render_type_cell "$t_ipreg_use")" "$(render_type_cell "$t_ip2loc_use")" \
+                "$(render_type_cell "$t_pcheck")" "$(render_type_cell "$t_ipquery_use")" "$(render_type_cell "$t_ipapi_use")"
+            printf "${C_CYAN}公司类型：${C_RESET}%b%b%b%b%b%b\n" \
+                "$(render_type_cell "$t_ipinfo_com")" "$(render_type_cell "$t_ipreg_com")" "$(render_type_cell "$t_ip2loc_com")" \
+                "$(render_type_cell "")" "$(render_type_cell "")" "$(render_type_cell "")"
+        fi
+        if [[ -n "$t_ipapi_is_use" || -n "$t_ipapi_is_com" || -n "$t_abuse_use" ]]; then
+            local ext_t_hdr="" ext_t_use="" ext_t_com=""
+            if [[ -n "$t_ipapi_is_use" || -n "$t_ipapi_is_com" ]]; then
+                ext_t_hdr+=" ipapi.is "
+                ext_t_use+="$(render_type_cell "$t_ipapi_is_use")"
+                ext_t_com+="$(render_type_cell "$t_ipapi_is_com")"
+            fi
+            if [[ -n "$t_abuse_use" ]]; then
+                ext_t_hdr+="AbuseIPDB "
+                ext_t_use+="$(render_type_cell "$t_abuse_use")"
+                ext_t_com+="$(render_type_cell "")"
+            fi
+            if [[ "$LANG_CODE" == "en" ]]; then
+                echo -e "${C_CYAN}Ext. DBs: ${C_RESET}${C_ITALIC}${ext_t_hdr}${C_RESET}"
+                printf "${C_CYAN}Usage:    ${C_RESET}%b\n" "$ext_t_use"
+                printf "${C_CYAN}Company:  ${C_RESET}%b\n" "$ext_t_com"
+            else
+                echo -e "${C_CYAN}扩展库：  ${C_RESET}${C_ITALIC}${ext_t_hdr}${C_RESET}"
+                printf "${C_CYAN}使用类型：${C_RESET}%b\n" "$ext_t_use"
+                printf "${C_CYAN}公司类型：${C_RESET}%b\n" "$ext_t_com"
+            fi
         fi
 
         # 三、风险评分（经典三色渐变热力条 + 紧随进度条后的分值与风险等级）
+        local dbip_risk_disp="" dbip_risk_color=""
+        if [[ -n "$s_dbip_num" ]]; then
+            case "$s_dbip_lvl" in
+                low)    dbip_risk_color="$C_GREEN";  [[ "$LANG_CODE" == "en" ]] && dbip_risk_disp="Low"    || dbip_risk_disp="低风险" ;;
+                medium) dbip_risk_color="$C_YELLOW"; [[ "$LANG_CODE" == "en" ]] && dbip_risk_disp="Medium" || dbip_risk_disp="中风险" ;;
+                high)   dbip_risk_color="$C_RED";    [[ "$LANG_CODE" == "en" ]] && dbip_risk_disp="High"   || dbip_risk_disp="高风险" ;;
+            esac
+        fi
+
         if [[ "$LANG_CODE" == "en" ]]; then
             echo -e "3. Risk Score"
             echo -e "${C_CYAN}Levels:         ${C_BLACK}${BG_GREEN} VeryLow  Low ${BG_YELLOW}    Medium    ${BG_RED} High VeryHigh${C_RESET}"
-            [[ "$s_scam" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}Scamalytics:    ${C_RESET}%b\n" "$(render_risk_bar "$s_scam")"
-            [[ "$s_pcheck" =~ ^[0-9]+$ ]]  && printf "${C_CYAN}ProxyCheck:     ${C_RESET}%b\n" "$(render_risk_bar "$s_pcheck")"
-            [[ "$s_ipquery" =~ ^[0-9]+$ ]] && printf "${C_CYAN}IPQuery:        ${C_RESET}%b\n" "$(render_risk_bar "$s_ipquery")"
-            [[ "$s_abuse" =~ ^[0-9]+$ ]]   && printf "${C_CYAN}AbuseIPDB:      ${C_RESET}%b\n" "$(render_risk_bar "$s_abuse")"
-            [[ "$s_ipqs" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}IPQS:           ${C_RESET}%b\n" "$(render_risk_bar "$s_ipqs")"
+            [[ "$s_ip2loc" =~ ^[0-9]+$ ]]   && printf "${C_CYAN}IP2Location:    ${C_RESET}%b\n" "$(render_risk_bar "$s_ip2loc")"
+            [[ "$s_scam" =~ ^[0-9]+$ ]]     && printf "${C_CYAN}Scamalytics:    ${C_RESET}%b\n" "$(render_risk_bar "$s_scam")"
+            [[ "$s_pcheck" =~ ^[0-9]+$ ]]   && printf "${C_CYAN}ProxyCheck:     ${C_RESET}%b\n" "$(render_risk_bar "$s_pcheck")"
+            [[ "$s_ipquery" =~ ^[0-9]+$ ]]  && printf "${C_CYAN}IPQuery:        ${C_RESET}%b\n" "$(render_risk_bar "$s_ipquery")"
+            [[ -n "$s_dbip_num" ]]          && printf "${C_CYAN}DB-IP:          ${C_RESET}%b\n" "$(render_risk_bar "$s_dbip_num" "-" "$dbip_risk_disp" "$dbip_risk_color")"
+            [[ "$s_ipapi_bar" =~ ^[0-9]+$ ]] && printf "${C_CYAN}ipapi.is:       ${C_RESET}%b\n" "$(render_risk_bar "$s_ipapi_bar" "$s_ipapi_pct" "$s_ipapi_risk_txt" "$s_ipapi_color")"
+            [[ "$s_abuse" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}AbuseIPDB:      ${C_RESET}%b\n" "$(render_risk_bar "$s_abuse")"
+            [[ "$s_ipqs" =~ ^[0-9]+$ ]]     && printf "${C_CYAN}IPQS:           ${C_RESET}%b\n" "$(render_risk_bar "$s_ipqs")"
             printf "${C_CYAN}${C_BOLD}Composite:      ${C_RESET}%b\n" "$(render_risk_bar "$avg_score")"
         else
             echo -e "三、风险评分"
             echo -e "${C_CYAN}风险等级：      ${C_BLACK}${BG_GREEN} 极低      低 ${BG_YELLOW}     中等     ${BG_RED} 高      极高 ${C_RESET}"
-            [[ "$s_scam" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}Scamalytics：   ${C_RESET}%b\n" "$(render_risk_bar "$s_scam")"
-            [[ "$s_pcheck" =~ ^[0-9]+$ ]]  && printf "${C_CYAN}ProxyCheck：    ${C_RESET}%b\n" "$(render_risk_bar "$s_pcheck")"
-            [[ "$s_ipquery" =~ ^[0-9]+$ ]] && printf "${C_CYAN}IPQuery：       ${C_RESET}%b\n" "$(render_risk_bar "$s_ipquery")"
-            [[ "$s_abuse" =~ ^[0-9]+$ ]]   && printf "${C_CYAN}AbuseIPDB：     ${C_RESET}%b\n" "$(render_risk_bar "$s_abuse")"
-            [[ "$s_ipqs" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}IPQS：          ${C_RESET}%b\n" "$(render_risk_bar "$s_ipqs")"
+            [[ "$s_ip2loc" =~ ^[0-9]+$ ]]   && printf "${C_CYAN}IP2Location：   ${C_RESET}%b\n" "$(render_risk_bar "$s_ip2loc")"
+            [[ "$s_scam" =~ ^[0-9]+$ ]]     && printf "${C_CYAN}Scamalytics：   ${C_RESET}%b\n" "$(render_risk_bar "$s_scam")"
+            [[ "$s_pcheck" =~ ^[0-9]+$ ]]   && printf "${C_CYAN}ProxyCheck：    ${C_RESET}%b\n" "$(render_risk_bar "$s_pcheck")"
+            [[ "$s_ipquery" =~ ^[0-9]+$ ]]  && printf "${C_CYAN}IPQuery：       ${C_RESET}%b\n" "$(render_risk_bar "$s_ipquery")"
+            [[ -n "$s_dbip_num" ]]          && printf "${C_CYAN}DB-IP：         ${C_RESET}%b\n" "$(render_risk_bar "$s_dbip_num" "-" "$dbip_risk_disp" "$dbip_risk_color")"
+            [[ "$s_ipapi_bar" =~ ^[0-9]+$ ]] && printf "${C_CYAN}ipapi.is：      ${C_RESET}%b\n" "$(render_risk_bar "$s_ipapi_bar" "$s_ipapi_pct" "$s_ipapi_risk_txt" "$s_ipapi_color")"
+            [[ "$s_abuse" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}AbuseIPDB：     ${C_RESET}%b\n" "$(render_risk_bar "$s_abuse")"
+            [[ "$s_ipqs" =~ ^[0-9]+$ ]]     && printf "${C_CYAN}IPQS：          ${C_RESET}%b\n" "$(render_risk_bar "$s_ipqs")"
             printf "${C_CYAN}${C_BOLD}综合评级：      ${C_RESET}%b\n" "$(render_risk_bar "$avg_score")"
         fi
 
-        # 四、风险因子
+        # 四、风险因子（8 大免Key直连库，总宽 8 + 8*8 = 72 列精确对齐 + 可选扩展库子表）
         if [[ "$LANG_CODE" == "en" ]]; then
             echo -e "4. Risk Factors"
-            echo -e "${C_CYAN}DB:      ${C_RESET}${C_ITALIC}  IPinfo    IPQuery   ProxyChk  Scamalyt   IP-API    IP2Loc ${C_RESET}"
-            printf "${C_CYAN}Region:  ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_cc "$cc_ii")" "$(render_factor_cc "$cc_iq")" "$(render_factor_cc "$cc_pc")" "$(render_factor_cc "$cc_sc")" "$(render_factor_cc "$cc_ia")" "$(render_factor_cc "$cc_i2")"
-            printf "${C_CYAN}Proxy:   ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$px_ii")" "$(render_factor_bool "$px_iq")" "$(render_factor_bool "$px_pc")" "$(render_factor_bool "$px_sc")" "$(render_factor_bool "$px_ia")" "$(render_factor_bool "$px_i2")"
-            printf "${C_CYAN}VPN:     ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$vpn_ii")" "$(render_factor_bool "$vpn_iq")" "$(render_factor_bool "$vpn_pc")" "$(render_factor_bool "$vpn_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
-            printf "${C_CYAN}Tor:     ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$tor_ii")" "$(render_factor_bool "$tor_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "$tor_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
-            printf "${C_CYAN}Server:  ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$srv_ii")" "$(render_factor_bool "$srv_iq")" "$(render_factor_bool "$srv_pc")" "$(render_factor_bool "$srv_sc")" "$(render_factor_bool "$srv_ia")" "$(render_factor_bool "null")"
-            printf "${C_CYAN}Mobile:  ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$mob_ii")" "$(render_factor_bool "$mob_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$mob_ia")" "$(render_factor_bool "null")"
-            printf "${C_CYAN}Robot:   ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$rob_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            echo -e "${C_CYAN}DB:     ${C_RESET}${C_ITALIC} IP2Loc  IPinfo  ipreg   Scamal ProxyCh IPQuery  IP-API  DB-IP  ${C_RESET}"
+            printf "${C_CYAN}Region: ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_cc "$cc_i2")" "$(render_factor_cc "$cc_ii")" "$(render_factor_cc "$cc_ir")" "$(render_factor_cc "$cc_sc")" "$(render_factor_cc "$cc_pc")" "$(render_factor_cc "$cc_iq")" "$(render_factor_cc "$cc_ia")" "$(render_factor_cc "$cc_db")"
+            printf "${C_CYAN}Proxy:  ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$px_i2")" "$(render_factor_bool "$px_ii")" "$(render_factor_bool "$px_ir")" "$(render_factor_bool "$px_sc")" "$(render_factor_bool "$px_pc")" "$(render_factor_bool "$px_iq")" "$(render_factor_bool "$px_ia")" "$(render_factor_bool "$px_db")"
+            printf "${C_CYAN}Tor:    ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$tor_i2")" "$(render_factor_bool "$tor_ii")" "$(render_factor_bool "$tor_ir")" "$(render_factor_bool "$tor_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "$tor_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}VPN:    ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$vpn_i2")" "$(render_factor_bool "$vpn_ii")" "$(render_factor_bool "$vpn_ir")" "$(render_factor_bool "$vpn_sc")" "$(render_factor_bool "$vpn_pc")" "$(render_factor_bool "$vpn_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}Server: ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$srv_i2")" "$(render_factor_bool "$srv_ii")" "$(render_factor_bool "$srv_ir")" "$(render_factor_bool "$srv_sc")" "$(render_factor_bool "$srv_pc")" "$(render_factor_bool "$srv_iq")" "$(render_factor_bool "$srv_ia")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}Abuser: ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$abu_i2")" "$(render_factor_bool "null")" "$(render_factor_bool "$abu_ir")" "$(render_factor_bool "$abu_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}Mobile: ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$mob_i2")" "$(render_factor_bool "$mob_ii")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$mob_iq")" "$(render_factor_bool "$mob_ia")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}Robot:  ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$rob_i2")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$rob_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$rob_db")"
         else
             echo -e "四、风险因子"
-            echo -e "${C_CYAN}库：     ${C_RESET}${C_ITALIC}  IPinfo    IPQuery   ProxyChk  Scamalyt   IP-API    IP2Loc ${C_RESET}"
-            printf "${C_CYAN}地区：   ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_cc "$cc_ii")" "$(render_factor_cc "$cc_iq")" "$(render_factor_cc "$cc_pc")" "$(render_factor_cc "$cc_sc")" "$(render_factor_cc "$cc_ia")" "$(render_factor_cc "$cc_i2")"
-            printf "${C_CYAN}代理：   ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$px_ii")" "$(render_factor_bool "$px_iq")" "$(render_factor_bool "$px_pc")" "$(render_factor_bool "$px_sc")" "$(render_factor_bool "$px_ia")" "$(render_factor_bool "$px_i2")"
-            printf "${C_CYAN}VPN：    ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$vpn_ii")" "$(render_factor_bool "$vpn_iq")" "$(render_factor_bool "$vpn_pc")" "$(render_factor_bool "$vpn_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
-            printf "${C_CYAN}Tor：    ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$tor_ii")" "$(render_factor_bool "$tor_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "$tor_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
-            printf "${C_CYAN}服务器： ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$srv_ii")" "$(render_factor_bool "$srv_iq")" "$(render_factor_bool "$srv_pc")" "$(render_factor_bool "$srv_sc")" "$(render_factor_bool "$srv_ia")" "$(render_factor_bool "null")"
-            printf "${C_CYAN}移动：   ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "$mob_ii")" "$(render_factor_bool "$mob_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$mob_ia")" "$(render_factor_bool "null")"
-            printf "${C_CYAN}机器人： ${C_RESET}%b%b%b%b%b%b\n" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$rob_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            echo -e "${C_CYAN}库：    ${C_RESET}${C_ITALIC} IP2Loc  IPinfo  ipreg   Scamal ProxyCh IPQuery  IP-API  DB-IP  ${C_RESET}"
+            printf "${C_CYAN}地区：  ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_cc "$cc_i2")" "$(render_factor_cc "$cc_ii")" "$(render_factor_cc "$cc_ir")" "$(render_factor_cc "$cc_sc")" "$(render_factor_cc "$cc_pc")" "$(render_factor_cc "$cc_iq")" "$(render_factor_cc "$cc_ia")" "$(render_factor_cc "$cc_db")"
+            printf "${C_CYAN}代理：  ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$px_i2")" "$(render_factor_bool "$px_ii")" "$(render_factor_bool "$px_ir")" "$(render_factor_bool "$px_sc")" "$(render_factor_bool "$px_pc")" "$(render_factor_bool "$px_iq")" "$(render_factor_bool "$px_ia")" "$(render_factor_bool "$px_db")"
+            printf "${C_CYAN}Tor：   ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$tor_i2")" "$(render_factor_bool "$tor_ii")" "$(render_factor_bool "$tor_ir")" "$(render_factor_bool "$tor_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "$tor_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}VPN：   ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$vpn_i2")" "$(render_factor_bool "$vpn_ii")" "$(render_factor_bool "$vpn_ir")" "$(render_factor_bool "$vpn_sc")" "$(render_factor_bool "$vpn_pc")" "$(render_factor_bool "$vpn_iq")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}服务器：${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$srv_i2")" "$(render_factor_bool "$srv_ii")" "$(render_factor_bool "$srv_ir")" "$(render_factor_bool "$srv_sc")" "$(render_factor_bool "$srv_pc")" "$(render_factor_bool "$srv_iq")" "$(render_factor_bool "$srv_ia")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}滥用：  ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$abu_i2")" "$(render_factor_bool "null")" "$(render_factor_bool "$abu_ir")" "$(render_factor_bool "$abu_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}移动：  ${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$mob_i2")" "$(render_factor_bool "$mob_ii")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$mob_iq")" "$(render_factor_bool "$mob_ia")" "$(render_factor_bool "null")"
+            printf "${C_CYAN}机器人：${C_RESET}%b%b%b%b%b%b%b%b\n" "$(render_factor_bool "$rob_i2")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$rob_sc")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "null")" "$(render_factor_bool "$rob_db")"
+        fi
+
+        # 若已配置免费扩展库（ipapi.is / AbuseIPDB / ipdata / IPQS）且返回数据，自动展示对齐扩展因子表
+        if [[ -f "$f_ipapi_is" || -f "$f_abuse" || -f "$f_ipdata" || -f "$f_ipqs" ]]; then
+            local ex_hdr="" ex_cc="" ex_px="" ex_tor="" ex_vpn="" ex_srv="" ex_abu="" ex_mob="" ex_rob=""
+            if [[ -f "$f_ipapi_is" ]]; then
+                ex_hdr+="ipapi.is"; ex_cc+="$(render_factor_cc "$cc_is")"; ex_px+="$(render_factor_bool "$px_is")"; ex_tor+="$(render_factor_bool "$tor_is")"
+                ex_vpn+="$(render_factor_bool "$vpn_is")"; ex_srv+="$(render_factor_bool "$srv_is")"; ex_abu+="$(render_factor_bool "$abu_is")"; ex_mob+="$(render_factor_bool "$mob_is")"; ex_rob+="$(render_factor_bool "$rob_is")"
+            fi
+            if [[ -f "$f_abuse" ]]; then
+                ex_hdr+="AbuseIP "; ex_cc+="$(render_factor_cc "$cc_ab")"; ex_px+="$(render_factor_bool "null")"; ex_tor+="$(render_factor_bool "$tor_ab")"
+                ex_vpn+="$(render_factor_bool "null")"; ex_srv+="$(render_factor_bool "null")"; ex_abu+="$(render_factor_bool "$abu_ab")"; ex_mob+="$(render_factor_bool "null")"; ex_rob+="$(render_factor_bool "null")"
+            fi
+            if [[ -f "$f_ipdata" ]]; then
+                ex_hdr+=" ipdata "; ex_cc+="$(render_factor_cc "$cc_id")"; ex_px+="$(render_factor_bool "$px_id")"; ex_tor+="$(render_factor_bool "$tor_id")"
+                ex_vpn+="$(render_factor_bool "null")"; ex_srv+="$(render_factor_bool "$srv_id")"; ex_abu+="$(render_factor_bool "$abu_id")"; ex_mob+="$(render_factor_bool "null")"; ex_rob+="$(render_factor_bool "null")"
+            fi
+            if [[ -f "$f_ipqs" ]]; then
+                ex_hdr+="  IPQS  "; ex_cc+="$(render_factor_cc "$cc_qs")"; ex_px+="$(render_factor_bool "$px_qs")"; ex_tor+="$(render_factor_bool "$tor_qs")"
+                ex_vpn+="$(render_factor_bool "$vpn_qs")"; ex_srv+="$(render_factor_bool "null")"; ex_abu+="$(render_factor_bool "$abu_qs")"; ex_mob+="$(render_factor_bool "$mob_qs")"; ex_rob+="$(render_factor_bool "$rob_qs")"
+            fi
+            if [[ "$LANG_CODE" == "en" ]]; then
+                echo -e "${C_CYAN}ExtDB:  ${C_RESET}${C_ITALIC}${ex_hdr}${C_RESET}"
+                printf "${C_CYAN}Region: ${C_RESET}%b\n" "$ex_cc"
+                printf "${C_CYAN}Proxy:  ${C_RESET}%b\n" "$ex_px"
+                printf "${C_CYAN}Tor:    ${C_RESET}%b\n" "$ex_tor"
+                printf "${C_CYAN}VPN:    ${C_RESET}%b\n" "$ex_vpn"
+                printf "${C_CYAN}Server: ${C_RESET}%b\n" "$ex_srv"
+                printf "${C_CYAN}Abuser: ${C_RESET}%b\n" "$ex_abu"
+                printf "${C_CYAN}Mobile: ${C_RESET}%b\n" "$ex_mob"
+                printf "${C_CYAN}Robot:  ${C_RESET}%b\n" "$ex_rob"
+            else
+                echo -e "${C_CYAN}扩展库：${C_RESET}${C_ITALIC}${ex_hdr}${C_RESET}"
+                printf "${C_CYAN}地区：  ${C_RESET}%b\n" "$ex_cc"
+                printf "${C_CYAN}代理：  ${C_RESET}%b\n" "$ex_px"
+                printf "${C_CYAN}Tor：   ${C_RESET}%b\n" "$ex_tor"
+                printf "${C_CYAN}VPN：   ${C_RESET}%b\n" "$ex_vpn"
+                printf "${C_CYAN}服务器：${C_RESET}%b\n" "$ex_srv"
+                printf "${C_CYAN}滥用：  ${C_RESET}%b\n" "$ex_abu"
+                printf "${C_CYAN}移动：  ${C_RESET}%b\n" "$ex_mob"
+                printf "${C_CYAN}机器人：${C_RESET}%b\n" "$ex_rob"
+            fi
+        fi
+
+        if (( sfs_appears > 0 )); then
+            if [[ "$LANG_CODE" == "en" ]]; then
+                echo -e "${C_RED}${C_BOLD}StopForumSpam Alert: Listed (frequency=${sfs_freq}, confidence=${sfs_conf}%)${C_RESET}"
+            else
+                echo -e "${C_RED}${C_BOLD}StopForumSpam 告警：已收录垃圾/滥用源 (频次: ${sfs_freq}, 置信度: ${sfs_conf}%)${C_RESET}"
+            fi
+        fi
+
+        local missing_keys=""
+        [[ -z "${IPAPI_IS_API_KEY:-}" ]]  && missing_keys="${missing_keys}${missing_keys:+/}ipapi.is"
+        [[ -z "${ABUSEIPDB_API_KEY:-}" ]] && missing_keys="${missing_keys}${missing_keys:+/}AbuseIPDB"
+        [[ -z "${IPDATA_API_KEY:-}" ]]    && missing_keys="${missing_keys}${missing_keys:+/}ipdata"
+        [[ -z "${IPQS_API_KEY:-}" ]]      && missing_keys="${missing_keys}${missing_keys:+/}IPQS"
+        if [[ -n "$missing_keys" ]]; then
+            if [[ "$LANG_CODE" == "en" ]]; then
+                echo -e "${C_DIM}Tip: Run --keys to add free API keys for ${missing_keys}${C_RESET}"
+            else
+                echo -e "${C_DIM}提示：运行 --keys 可配置免费自有 Key 一键启用 ${missing_keys} 扩展库${C_RESET}"
+            fi
         fi
 
         # 五、流媒体及AI服务解锁检测（经典 8 列横向色块矩阵）
@@ -3031,6 +4079,10 @@ parse_cli_args() {
             --update)
                 self_update
                 ;;
+            --keys)
+                configure_api_keys_interactive
+                exit 0
+                ;;
             --dry-run)
                 DRY_RUN=1
                 shift
@@ -3098,7 +4150,7 @@ interactive_loop() {
         while true; do
             show_summary
             echo ""
-            echo -e "操作: ${C_GREEN}[Enter]${C_RESET} 开始检测  |  ${C_PURPLE}[a]${C_RESET} 高级选项(语言/导出/JSON)  |  ${C_YELLOW}[r]${C_RESET} 重新配置  |  ${C_RED}[q]${C_RESET} 退出"
+            echo -e "操作: ${C_GREEN}[Enter]${C_RESET} 开始检测  |  ${C_PURPLE}[a]${C_RESET} 高级选项(语言/导出/Key)  |  ${C_YELLOW}[r]${C_RESET} 重新配置  |  ${C_RED}[q]${C_RESET} 退出"
             local action=""
             tty_read "请选择: " action
             case "$action" in
@@ -3126,6 +4178,7 @@ interactive_loop() {
 }
 
 main() {
+    load_saved_keys
     parse_cli_args "$@"
     check_env
     if [[ "$JSON_MODE" -eq 0 ]]; then
