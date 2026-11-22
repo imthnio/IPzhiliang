@@ -7,7 +7,7 @@
 
 set -u
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
 
 # 颜色定义
@@ -1968,7 +1968,7 @@ scan_mail_port25() {
 # 渲染辅助函数（经典 72 列视觉风格：三色渐变评分条、色块标签、横向解锁矩阵）
 # ==============================================================================
 
-# 经典 42 列三色渐变风险条（绿 0-33% -> 黄 33-66% -> 红 66-100%，右侧定宽垂直对齐分值与风险等级，总宽精准 72 列）
+# 经典 42 列三色渐变风险条（绿 0-33% -> 黄 33-66% -> 红 66-100%，分值与风险等级紧随进度条后，总宽 <= 72 列）
 render_risk_bar() {
     local score="$1"
     (( score < 0 )) && score=0
@@ -2001,26 +2001,22 @@ render_risk_bar() {
     fi
 
     local left_pad=$(( fill_len - 1 ))
-    local right_pad=$(( bar_w - fill_len ))
-    local filled_str empty_str
+    local filled_str
     filled_str="$(printf '%*s' "$left_pad" '')|"
-    empty_str="$(printf '%*s' "$right_pad" '')"
 
     local s1="${filled_str:0:14}"
     local s2="${filled_str:14:14}"
     local s3="${filled_str:28:14}"
 
     local out=""
-    [[ -n "$s1" ]] && out+="${BG_GREEN}${C_WHITE}${C_BOLD}${s1}"
-    [[ -n "$s2" ]] && out+="${BG_YELLOW}${C_WHITE}${C_BOLD}${s2}"
-    [[ -n "$s3" ]] && out+="${BG_RED}${C_WHITE}${C_BOLD}${s3}"
-    local score_fmt
-    printf -v score_fmt '%3d' "$score"
-    out+="${C_RESET}${empty_str}  ${risk_color}${C_BOLD}${score_fmt} ${risk_text}${C_RESET}"
+    [[ -n "$s1" ]] && out+="${BG_GREEN}${C_BLACK}${s1}"
+    [[ -n "$s2" ]] && out+="${BG_YELLOW}${C_BLACK}${s2}"
+    [[ -n "$s3" ]] && out+="${BG_RED}${C_BLACK}${s3}"
+    out+="${C_RESET} ${risk_color}${C_BOLD}${score} ${risk_text}${C_RESET}"
     printf "%b" "$out"
 }
 
-# 12 列定宽色块类型标签（用于「二、IP类型属性」横向矩阵，未知/无统一使用紫色色块）
+# 12 列定宽色块类型标签（用于「二、IP类型属性」横向矩阵，深色字体高对比度，未知/无使用紫色色块）
 render_type_cell() {
     local raw="$1"
     local low
@@ -2028,48 +2024,48 @@ render_type_cell() {
     if [[ "$LANG_CODE" == "en" ]]; then
         case "$low" in
             isp|residential|"fixed line isp")
-                printf "   ${BG_GREEN}${C_WHITE}${C_BOLD} ISP ${C_RESET}    " ;;
+                printf "   ${BG_GREEN}${C_BLACK} ISP ${C_RESET}    " ;;
             mobile|wireless)
-                printf "  ${BG_GREEN}${C_WHITE}${C_BOLD} Mobile ${C_RESET}  " ;;
+                printf "  ${BG_GREEN}${C_BLACK} Mobile ${C_RESET}  " ;;
             business|commercial)
-                printf " ${BG_YELLOW}${C_WHITE}${C_BOLD} Business ${C_RESET} " ;;
+                printf " ${BG_YELLOW}${C_BLACK} Business ${C_RESET} " ;;
             hosting|datacenter)
-                printf " ${BG_RED}${C_WHITE}${C_BOLD} Hosting ${C_RESET}  " ;;
+                printf " ${BG_RED}${C_BLACK} Hosting ${C_RESET}  " ;;
             vpn)
-                printf "   ${BG_RED}${C_WHITE}${C_BOLD} VPN ${C_RESET}    " ;;
+                printf "   ${BG_RED}${C_BLACK} VPN ${C_RESET}    " ;;
             socks*|proxy|compromised)
-                printf "  ${BG_RED}${C_WHITE}${C_BOLD} Proxy ${C_RESET}   " ;;
+                printf "  ${BG_RED}${C_BLACK} Proxy ${C_RESET}   " ;;
             education)
-                printf "${BG_YELLOW}${C_WHITE}${C_BOLD} Education ${C_RESET} " ;;
+                printf "${BG_YELLOW}${C_BLACK} Education ${C_RESET} " ;;
             government)
-                printf "   ${BG_YELLOW}${C_WHITE}${C_BOLD} Gov. ${C_RESET}   " ;;
+                printf "   ${BG_YELLOW}${C_BLACK} Gov. ${C_RESET}   " ;;
             ""|null|unknown)
-                printf "   ${BG_PURPLE}${C_WHITE}${C_BOLD} N/A ${C_RESET}    " ;;
+                printf "   ${BG_PURPLE}${C_BLACK} N/A ${C_RESET}    " ;;
             *)
-                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} Other ${C_RESET}   " ;;
+                printf "  ${BG_YELLOW}${C_BLACK} Other ${C_RESET}   " ;;
         esac
     else
         case "$low" in
             isp|residential|"fixed line isp")
-                printf "  ${BG_GREEN}${C_WHITE}${C_BOLD} 家宽 ${C_RESET}    " ;;
+                printf "  ${BG_GREEN}${C_BLACK} 家宽 ${C_RESET}    " ;;
             mobile|wireless)
-                printf "  ${BG_GREEN}${C_WHITE}${C_BOLD} 移动 ${C_RESET}    " ;;
+                printf "  ${BG_GREEN}${C_BLACK} 移动 ${C_RESET}    " ;;
             business|commercial)
-                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} 商业 ${C_RESET}    " ;;
+                printf "  ${BG_YELLOW}${C_BLACK} 商业 ${C_RESET}    " ;;
             hosting|datacenter)
-                printf "  ${BG_RED}${C_WHITE}${C_BOLD} 机房 ${C_RESET}    " ;;
+                printf "  ${BG_RED}${C_BLACK} 机房 ${C_RESET}    " ;;
             vpn)
-                printf "  ${BG_RED}${C_WHITE}${C_BOLD} VPN  ${C_RESET}    " ;;
+                printf "  ${BG_RED}${C_BLACK} VPN  ${C_RESET}    " ;;
             socks*|proxy|compromised)
-                printf "  ${BG_RED}${C_WHITE}${C_BOLD} 代理 ${C_RESET}    " ;;
+                printf "  ${BG_RED}${C_BLACK} 代理 ${C_RESET}    " ;;
             education)
-                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} 教育 ${C_RESET}    " ;;
+                printf "  ${BG_YELLOW}${C_BLACK} 教育 ${C_RESET}    " ;;
             government)
-                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} 政府 ${C_RESET}    " ;;
+                printf "  ${BG_YELLOW}${C_BLACK} 政府 ${C_RESET}    " ;;
             ""|null|unknown)
-                printf "  ${BG_PURPLE}${C_WHITE}${C_BOLD}  无  ${C_RESET}    " ;;
+                printf "  ${BG_PURPLE}${C_BLACK}  无  ${C_RESET}    " ;;
             *)
-                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} 其他 ${C_RESET}    " ;;
+                printf "  ${BG_YELLOW}${C_BLACK} 其他 ${C_RESET}    " ;;
         esac
     fi
 }
@@ -2115,28 +2111,28 @@ render_factor_bool() {
     esac
 }
 
-# 8 列定宽流媒体/AI 色块状态标签（横向矩阵）
+# 8 列定宽流媒体/AI 色块状态标签（横向矩阵，深色字体高对比度）
 render_media_badge_8() {
     local status="$1"
     if [[ "$LANG_CODE" == "en" ]]; then
         case "$status" in
-            yes)       printf " ${BG_GREEN}${C_WHITE}${C_BOLD} Yes  ${C_RESET} " ;;
-            originals) printf "${BG_YELLOW}${C_WHITE}${C_BOLD} Orig.  ${C_RESET}" ;;
-            api_only)  printf "${BG_YELLOW}${C_WHITE}${C_BOLD} APIOnl ${C_RESET}" ;;
-            no_prem)   printf "${BG_RED}${C_WHITE}${C_BOLD} NoPrem ${C_RESET}" ;;
-            blocked)   printf "${BG_RED}${C_WHITE}${C_BOLD} Block  ${C_RESET}" ;;
-            no_ipv6)   printf " ${BG_PURPLE}${C_WHITE}${C_BOLD} NoV6 ${C_RESET} " ;;
-            *)         printf " ${BG_RED}${C_WHITE}${C_BOLD} Fail ${C_RESET} " ;;
+            yes)       printf " ${BG_GREEN}${C_BLACK} Yes  ${C_RESET} " ;;
+            originals) printf "${BG_YELLOW}${C_BLACK} Orig.  ${C_RESET}" ;;
+            api_only)  printf "${BG_YELLOW}${C_BLACK} APIOnl ${C_RESET}" ;;
+            no_prem)   printf "${BG_RED}${C_BLACK} NoPrem ${C_RESET}" ;;
+            blocked)   printf "${BG_RED}${C_BLACK} Block  ${C_RESET}" ;;
+            no_ipv6)   printf " ${BG_PURPLE}${C_BLACK} NoV6 ${C_RESET} " ;;
+            *)         printf " ${BG_RED}${C_BLACK} Fail ${C_RESET} " ;;
         esac
     else
         case "$status" in
-            yes)       printf " ${BG_GREEN}${C_WHITE}${C_BOLD} 解锁 ${C_RESET} " ;;
-            originals) printf "${BG_YELLOW}${C_WHITE}${C_BOLD} 仅自制 ${C_RESET}" ;;
-            api_only)  printf "${BG_YELLOW}${C_WHITE}${C_BOLD} 仅API  ${C_RESET}" ;;
-            no_prem)   printf "${BG_RED}${C_WHITE}${C_BOLD} 禁会员 ${C_RESET}" ;;
-            blocked)   printf " ${BG_RED}${C_WHITE}${C_BOLD} 屏蔽 ${C_RESET} " ;;
-            no_ipv6)   printf " ${BG_PURPLE}${C_WHITE}${C_BOLD} 无V6 ${C_RESET} " ;;
-            *)         printf " ${BG_RED}${C_WHITE}${C_BOLD} 失败 ${C_RESET} " ;;
+            yes)       printf " ${BG_GREEN}${C_BLACK} 解锁 ${C_RESET} " ;;
+            originals) printf "${BG_YELLOW}${C_BLACK} 仅自制 ${C_RESET}" ;;
+            api_only)  printf "${BG_YELLOW}${C_BLACK} 仅API  ${C_RESET}" ;;
+            no_prem)   printf "${BG_RED}${C_BLACK} 禁会员 ${C_RESET}" ;;
+            blocked)   printf " ${BG_RED}${C_BLACK} 屏蔽 ${C_RESET} " ;;
+            no_ipv6)   printf " ${BG_PURPLE}${C_BLACK} 无V6 ${C_RESET} " ;;
+            *)         printf " ${BG_RED}${C_BLACK} 失败 ${C_RESET} " ;;
         esac
     fi
 }
@@ -2164,9 +2160,9 @@ render_mail_badges() {
     local p out=""
     for p in "${providers[@]}"; do
         if [[ ",${ok_csv}," == *",${p},"* ]]; then
-            out+="${C_GREEN}+${C_RESET}${BG_GREEN}${C_WHITE}${C_BOLD}${p}${C_RESET} "
+            out+="${C_GREEN}+${C_RESET}${BG_GREEN}${C_BLACK}${p}${C_RESET} "
         elif [[ ",${fail_csv}," == *",${p},"* ]]; then
-            out+="${C_RED}-${C_RESET}${BG_RED}${C_WHITE}${C_BOLD}${p}${C_RESET} "
+            out+="${C_RED}-${C_RESET}${BG_RED}${C_BLACK}${p}${C_RESET} "
         fi
     done
     printf "%b" "$out"
@@ -2414,10 +2410,10 @@ run_single_ip_check() {
     if [[ -n "$country_code" && -n "$reg_country" ]]; then
         if [[ "$country_code" == "$reg_country" ]]; then
             geo_type_code="native"
-            [[ "$LANG_CODE" == "en" ]] && geo_type_label="${BG_GREEN}${C_WHITE}${C_BOLD} Native IP ${C_RESET}" || geo_type_label="${BG_GREEN}${C_WHITE}${C_BOLD} 原生 IP ${C_RESET}"
+            [[ "$LANG_CODE" == "en" ]] && geo_type_label="${BG_GREEN}${C_BLACK} Native IP ${C_RESET}" || geo_type_label="${BG_GREEN}${C_BLACK} 原生 IP ${C_RESET}"
         else
             geo_type_code="broadcast"
-            [[ "$LANG_CODE" == "en" ]] && geo_type_label="${BG_YELLOW}${C_WHITE}${C_BOLD} Broadcast IP ${C_RESET}" || geo_type_label="${BG_YELLOW}${C_WHITE}${C_BOLD} 广播 IP ${C_RESET}"
+            [[ "$LANG_CODE" == "en" ]] && geo_type_label="${BG_YELLOW}${C_BLACK} Broadcast IP ${C_RESET}" || geo_type_label="${BG_YELLOW}${C_BLACK} 广播 IP ${C_RESET}"
         fi
     fi
 
@@ -2588,9 +2584,9 @@ run_single_ip_check() {
             echo -e "${C_CYAN}Time Zone:              ${C_GREEN}${timezone:-N/A}${C_RESET}"
             if [[ -n "$country_code" && -n "$reg_country" ]]; then
                 if [[ "$country_code" == "$reg_country" ]]; then
-                    echo -e "${C_CYAN}IP Type:                ${BG_GREEN}${C_WHITE}${C_BOLD} Geo-consistent ${C_RESET}"
+                    echo -e "${C_CYAN}IP Type:                ${BG_GREEN}${C_BLACK} Geo-consistent ${C_RESET}"
                 else
-                    echo -e "${C_CYAN}IP Type:                ${BG_RED}${C_WHITE}${C_BOLD} Geo-discrepant ${C_RESET}"
+                    echo -e "${C_CYAN}IP Type:                ${BG_RED}${C_BLACK} Geo-discrepant ${C_RESET}"
                 fi
             fi
             [[ "$is_anycast" == "true" ]] && echo -e "${C_CYAN}Routing:                ${C_YELLOW}Anycast${C_RESET}"
@@ -2605,9 +2601,9 @@ run_single_ip_check() {
             echo -e "${C_CYAN}时区：                  ${C_GREEN}${timezone:-N/A}${C_RESET}"
             if [[ -n "$country_code" && -n "$reg_country" ]]; then
                 if [[ "$country_code" == "$reg_country" ]]; then
-                    echo -e "${C_CYAN}IP类型：                ${BG_GREEN}${C_WHITE}${C_BOLD} 原生IP ${C_RESET}"
+                    echo -e "${C_CYAN}IP类型：                ${BG_GREEN}${C_BLACK} 原生IP ${C_RESET}"
                 else
-                    echo -e "${C_CYAN}IP类型：                ${BG_RED}${C_WHITE}${C_BOLD} 广播IP ${C_RESET}"
+                    echo -e "${C_CYAN}IP类型：                ${BG_RED}${C_BLACK} 广播IP ${C_RESET}"
                 fi
             fi
             [[ "$is_anycast" == "true" ]] && echo -e "${C_CYAN}网络属性：              ${C_YELLOW}Anycast (任播网络)${C_RESET}"
@@ -2626,10 +2622,10 @@ run_single_ip_check() {
             printf "${C_CYAN}公司类型：  ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_com")" "$(render_type_cell "")" "$(render_type_cell "")" "$(render_type_cell "")"
         fi
 
-        # 三、风险评分（经典三色渐变热力条 + 右侧垂直对齐分值与风险等级）
+        # 三、风险评分（经典三色渐变热力条 + 紧随进度条后的分值与风险等级）
         if [[ "$LANG_CODE" == "en" ]]; then
             echo -e "3. Risk Score"
-            echo -e "${C_CYAN}Levels:         ${C_WHITE}${C_BOLD}${BG_GREEN} VeryLow  Low ${BG_YELLOW}    Medium    ${BG_RED} High VeryHigh${C_RESET}"
+            echo -e "${C_CYAN}Levels:         ${C_BLACK}${BG_GREEN} VeryLow  Low ${BG_YELLOW}    Medium    ${BG_RED} High VeryHigh${C_RESET}"
             [[ "$s_scam" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}Scamalytics:    ${C_RESET}%b\n" "$(render_risk_bar "$s_scam")"
             [[ "$s_pcheck" =~ ^[0-9]+$ ]]  && printf "${C_CYAN}ProxyCheck:     ${C_RESET}%b\n" "$(render_risk_bar "$s_pcheck")"
             [[ "$s_ipquery" =~ ^[0-9]+$ ]] && printf "${C_CYAN}IPQuery:        ${C_RESET}%b\n" "$(render_risk_bar "$s_ipquery")"
@@ -2638,7 +2634,7 @@ run_single_ip_check() {
             printf "${C_CYAN}${C_BOLD}Composite:      ${C_RESET}%b\n" "$(render_risk_bar "$avg_score")"
         else
             echo -e "三、风险评分"
-            echo -e "${C_CYAN}风险等级：      ${C_WHITE}${C_BOLD}${BG_GREEN} 极低      低 ${BG_YELLOW}     中等     ${BG_RED} 高      极高 ${C_RESET}"
+            echo -e "${C_CYAN}风险等级：      ${C_BLACK}${BG_GREEN} 极低      低 ${BG_YELLOW}     中等     ${BG_RED} 高      极高 ${C_RESET}"
             [[ "$s_scam" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}Scamalytics：   ${C_RESET}%b\n" "$(render_risk_bar "$s_scam")"
             [[ "$s_pcheck" =~ ^[0-9]+$ ]]  && printf "${C_CYAN}ProxyCheck：    ${C_RESET}%b\n" "$(render_risk_bar "$s_pcheck")"
             [[ "$s_ipquery" =~ ^[0-9]+$ ]] && printf "${C_CYAN}IPQuery：       ${C_RESET}%b\n" "$(render_risk_bar "$s_ipquery")"
