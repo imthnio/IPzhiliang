@@ -7,7 +7,7 @@
 
 set -u
 
-VERSION="2.1.1"
+VERSION="2.1.2"
 SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
 
 # 颜色定义
@@ -1658,10 +1658,29 @@ scan_dnsbl() {
                 ans=$(dig +short +time=2 +tries=1 "${rev_ip}.${z}" A 2>/dev/null | head -n1 || true)
             fi
 
-            if [[ -z "$ans" || "$ans" == 127.255.255.* || ! "$ans" =~ ^127\. ]]; then
-                echo "CLEAN" > "${dnsbl_dir}/${idx}.res"
-            else
+            local is_hit=0
+            if [[ -n "$ans" && "$ans" =~ ^127\. && "$ans" != 127.255.255.* && "$ans" != "127.0.1.255" ]]; then
+                case "$z" in
+                    hostkarma.junkemailfilter.com)
+                        # 127.0.0.1 为白名单，仅 127.0.0.2 为黑名单
+                        [[ "$ans" == "127.0.0.2" ]] && is_hit=1
+                        ;;
+                    bl.mailspike.net)
+                        # 127.0.0.15-20 为中立/优质信誉，仅 127.0.0.2 / 10 / 11 / 12 为黑名单
+                        case "$ans" in
+                            127.0.0.2|127.0.0.10|127.0.0.11|127.0.0.12) is_hit=1 ;;
+                        esac
+                        ;;
+                    *)
+                        is_hit=1
+                        ;;
+                esac
+            fi
+
+            if [[ $is_hit -eq 1 ]]; then
                 echo "HIT|${z}|${ans}" > "${dnsbl_dir}/${idx}.res"
+            else
+                echo "CLEAN" > "${dnsbl_dir}/${idx}.res"
             fi
         ) &
 
