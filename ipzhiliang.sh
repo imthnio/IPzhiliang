@@ -7,7 +7,7 @@
 
 set -u
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
 UPSTREAM_PRIMARY="https://IP.Check.Place"
 UPSTREAM_FALLBACK="https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh"
@@ -47,29 +47,30 @@ trap cleanup EXIT
 trap 'echo -e "\n${C_YELLOW}已取消检测。${C_RESET}"; exit 130' INT TERM
 
 # 兼容 `bash <(curl ...)` 和 `curl ... | bash` 的安全读取函数
+# 注意：内部变量使用 __tty_ 前缀，避免与调用方传入的变量名冲突
 tty_read() {
-    local prompt="$1"
-    local var_name="$2"
-    local silent="${3:-0}"
-    local input=""
+    local __tty_prompt="$1"
+    local __tty_var="$2"
+    local __tty_silent="${3:-0}"
+    local __tty_val=""
 
     if [[ -r /dev/tty ]]; then
-        if [[ "$silent" == "1" ]]; then
-            read -r -s -p "$prompt" input </dev/tty
+        if [[ "$__tty_silent" == "1" ]]; then
+            read -r -s -p "$__tty_prompt" __tty_val </dev/tty
             echo "" >/dev/tty
         else
-            read -r -p "$prompt" input </dev/tty
+            read -r -p "$__tty_prompt" __tty_val </dev/tty
         fi
     else
-        if [[ "$silent" == "1" ]]; then
-            read -r -s -p "$prompt" input
+        if [[ "$__tty_silent" == "1" ]]; then
+            read -r -s -p "$__tty_prompt" __tty_val
             echo ""
         else
-            read -r -p "$prompt" input
+            read -r -p "$__tty_prompt" __tty_val
         fi
     fi
 
-    printf -v "$var_name" '%s' "$input"
+    printf -v "$__tty_var" '%s' "$__tty_val"
 }
 
 # 自动识别当前操作系统与虚拟化环境（母鸡/小鸡）
@@ -557,18 +558,29 @@ configure_iface_target() {
     fi
 
     while true; do
-        local input=""
-        tty_read "请输入编号、网卡名 (如 eth0/warp) 或出口 IP: " input
-        input=$(echo "$input" | tr -d '[:space:]')
-        if [[ -z "$input" ]]; then
+        local iface_input=""
+        tty_read "请输入编号、网卡名 (如 eth0/warp) 或出口 IP (输入 b 返回): " iface_input
+        iface_input=$(echo "$iface_input" | tr -d '[:space:]')
+        if [[ "$iface_input" == "b" || "$iface_input" == "B" ]]; then
+            step_select_target
+            return
+        fi
+        if [[ -z "$iface_input" ]]; then
             echo -e "${C_YELLOW}输入不能为空。${C_RESET}"
             continue
         fi
-        if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#ifaces[@]} )); then
-            local selected="${ifaces[$((input - 1))]}"
-            TARGET_IFACE="${selected%% *}"
+        if [[ "$iface_input" =~ ^[0-9]+$ ]] && (( iface_input >= 1 && iface_input <= ${#ifaces[@]} )); then
+            local selected="${ifaces[$((iface_input - 1))]}"
+            # 提取括号里的具体 IP（去掉 /前缀），多 IP 网卡可直接精准绑定到选中的那个 IP
+            local extracted_ip
+            extracted_ip=$(echo "$selected" | sed -E 's/.*\(([^)/]+)(\/[0-9]+)?\).*/\1/')
+            if [[ -n "$extracted_ip" && "$extracted_ip" != "$selected" ]]; then
+                TARGET_IFACE="$extracted_ip"
+            else
+                TARGET_IFACE="${selected%% *}"
+            fi
         else
-            TARGET_IFACE="$input"
+            TARGET_IFACE="$iface_input"
         fi
         break
     done
