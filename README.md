@@ -2,6 +2,10 @@
 
 基于 [xykt/IPQuality](https://github.com/xykt/IPQuality)（`https://IP.Check.Place`）构建的中文交互式一键封装脚本，主打**零记忆参数、自动识别端口代理协议、清晰的隐私保护选项**，特别适合单机多出口、多端口代理分流（如端口 `21233` 走独立出口 IP）的 VPS 环境。
 
+<!-- UPSTREAM_STATUS_START -->
+> 上游同步状态：核心引擎 `v2026-11-07` · 上游提交 `8643bcd` · 每日 GitHub Actions 自动检测同步
+<!-- UPSTREAM_STATUS_END -->
+
 ## 一键运行
 
 ```bash
@@ -31,6 +35,10 @@ bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhil
    - **IP 协议版本选择**：双栈（IPv4 + IPv6）、仅 IPv4（`-4`）、仅 IPv6（`-6`）。
    - **执行前总览与脱敏预览**：开始检测前展示完整配置与等价命令（自动隐藏代理密码），支持按 `a` 进入高级选项、按 `r` 重新配置、按 `Enter` 直接开测。
    - **高级选项（按 `a`）**：切换报告语言（中/英/日/西/德/法/俄/葡）、导出报告到本地文件（`.txt` / `.ansi` / `.json`，多端口自动编号防覆盖）、终端 JSON 输出、依赖自动安装/跳过策略。
+   - **自动同步最新数据库与引擎**：
+     - 每次运行都会绕过缓存实时拉取最新 `IP.Check.Place` 引擎及黑名单/风险库，并在终端显示当前同步的上游版本号；
+     - 仓库内置 GitHub Actions（`.github/workflows/sync-upstream.yml`），每日自动追踪 `xykt/IPQuality` 与数据库更新并同步 `upstream_meta.json`；若上游新增命令行参数，还会自动创建 Issue 提醒适配；
+     - 本地保存的 `ipzhiliang.sh` 启动时自动检查新版本，也支持 `bash ipzhiliang.sh --update` 一键自更新。
    - **双源容错**：优先从 `https://IP.Check.Place` 拉取最新检测引擎，超时自动切换至 GitHub 备用源。
 
 ## 命令行快捷模式

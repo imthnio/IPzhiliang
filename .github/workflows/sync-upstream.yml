@@ -1,0 +1,131 @@
+name: Sync Upstream IPQuality & Databases
+
+on:
+  schedule:
+    # 每天 UTC 02:00（北京时间 10:00）自动检查上游检测引擎与数据库更新
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check upstream xykt/IPQuality and databases
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 获取上游最新 commit 与核心脚本/数据库文件
+          UP_COMMIT=$(curl -fsSL "https://api.github.com/repos/xykt/IPQuality/commits/main" | jq -r '.sha')
+          curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh" -o /tmp/upstream_ip.sh
+          curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/xykt/IPQuality/main/ref/dnsbl.list" -o /tmp/dnsbl.list || touch /tmp/dnsbl.list
+
+          SCRIPT_VER=$(grep -m1 '^script_version=' /tmp/upstream_ip.sh | cut -d'"' -f2)
+          GETOPTS_SPEC=$(grep -m1 'while getopts' /tmp/upstream_ip.sh | sed -E 's/.*getopts "([^"]+)".*/\1/' || true)
+          DNSBL_COUNT=$(grep -cve '^[[:space:]]*$' /tmp/dnsbl.list || echo 0)
+          NOW_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          OLD_COMMIT=$(jq -r '.upstream_commit // ""' upstream_meta.json 2>/dev/null || echo "")
+          OLD_VER=$(jq -r '.script_version // ""' upstream_meta.json 2>/dev/null || echo "")
+          OLD_GETOPTS=$(jq -r '.getopts_spec // ""' upstream_meta.json 2>/dev/null || echo "")
+          OLD_DNSBL=$(jq -r '.dnsbl_entries // 0' upstream_meta.json 2>/dev/null || echo 0)
+
+          echo "Upstream commit: ${UP_COMMIT}"
+          echo "Upstream script_version: ${SCRIPT_VER}"
+          echo "Upstream getopts: ${GETOPTS_SPEC}"
+          echo "Upstream DNSBL entries: ${DNSBL_COUNT}"
+
+          CHANGED="false"
+          if [[ "$UP_COMMIT" != "$OLD_COMMIT" || "$SCRIPT_VER" != "$OLD_VER" || "$DNSBL_COUNT" != "$OLD_DNSBL" || "$GETOPTS_SPEC" != "$OLD_GETOPTS" ]]; then
+            CHANGED="true"
+          fi
+
+          FLAGS_CHANGED="false"
+          if [[ -n "$GETOPTS_SPEC" && "$GETOPTS_SPEC" != "$OLD_GETOPTS" ]]; then
+            FLAGS_CHANGED="true"
+          fi
+
+          echo "changed=${CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "flags_changed=${FLAGS_CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "script_version=${SCRIPT_VER}" >> "$GITHUB_OUTPUT"
+          echo "upstream_commit=${UP_COMMIT:0:7}" >> "$GITHUB_OUTPUT"
+          echo "dnsbl_count=${DNSBL_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "getopts_spec=${GETOPTS_SPEC}" >> "$GITHUB_OUTPUT"
+          echo "old_getopts=${OLD_GETOPTS}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$CHANGED" == "true" ]]; then
+            jq -n \
+              --arg repo "xykt/IPQuality" \
+              --arg ver "$SCRIPT_VER" \
+              --arg commit "$UP_COMMIT" \
+              --arg opts "$GETOPTS_SPEC" \
+              --argjson dnsbl "$DNSBL_COUNT" \
+              --arg now "$NOW_UTC" \
+              '{
+                upstream_repo: $repo,
+                script_version: $ver,
+                upstream_commit: $commit,
+                getopts_spec: $opts,
+                dnsbl_entries: $dnsbl,
+                last_checked_utc: $now
+              }' > upstream_meta.json
+
+            python3 - "$SCRIPT_VER" "${UP_COMMIT:0:7}" "$DNSBL_COUNT" "$NOW_UTC" <<'PY'
+          import re, sys
+          ver, short_sha, dnsbl, now_utc = sys.argv[1:5]
+          with open("README.md", "r", encoding="utf-8") as f:
+              content = f.read()
+          block = (
+              "<!-- UPSTREAM_STATUS_START -->\n"
+              f"> 上游同步状态：核心引擎 `{ver}` · 上游提交 `{short_sha}` · 黑名单数据库 `{dnsbl}` 条 · 最近自动同步 `{now_utc}`\n"
+              "<!-- UPSTREAM_STATUS_END -->"
+          )
+          new_content = re.sub(
+              r"<!-- UPSTREAM_STATUS_START -->.*?<!-- UPSTREAM_STATUS_END -->",
+              block,
+              content,
+              flags=re.S,
+          )
+          with open("README.md", "w", encoding="utf-8") as f:
+              f.write(new_content)
+          PY
+          fi
+
+      - name: Commit and push updated upstream metadata
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add upstream_meta.json README.md
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(upstream): sync xykt/IPQuality ${GITHUB_RUN_NUMBER} (${{ steps.check.outputs.script_version }} / ${{ steps.check.outputs.upstream_commit }})"
+            git push
+          fi
+
+      - name: Notify if upstream CLI flags changed
+        if: steps.check.outputs.flags_changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="上游 IPQuality 新增/变更命令行参数 (${{ steps.check.outputs.script_version }})"
+          EXISTING=$(gh issue list --state open --search "$TITLE" --json number --jq 'length')
+          if [[ "$EXISTING" -eq 0 ]]; then
+            gh issue create \
+              --title "$TITLE" \
+              --body "检测到上游 \`xykt/IPQuality\` 的 \`getopts\` 参数定义发生变化：
+
+          - 原参数集：\`${{ steps.check.outputs.old_getopts }}\`
+          - 新参数集：\`${{ steps.check.outputs.getopts_spec }}\`
+          - 上游版本：\`${{ steps.check.outputs.script_version }}\` (\`${{ steps.check.outputs.upstream_commit }}\`)
+
+          请检查 \`ipzhiliang.sh\` 是否需要在交互菜单中适配新增参数。"
+          fi

@@ -7,7 +7,8 @@
 
 set -u
 
-VERSION="1.0.0"
+VERSION="1.1.0"
+SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
 UPSTREAM_PRIMARY="https://IP.Check.Place"
 UPSTREAM_FALLBACK="https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh"
 
@@ -106,9 +107,67 @@ IPzhiliang v${VERSION} - IP 质量交互式一键检测脚本
   -j                 以 JSON 格式输出
   -y                 自动安装缺失依赖 [默认]
   -n                 跳过系统与依赖检测
+  --update           将本地 ipzhiliang.sh 更新到 GitHub 最新版本
   --dry-run          仅打印最终将执行的命令，不实际运行检测
   -h, --help         显示本帮助信息
 EOF
+}
+
+# 本地脚本自更新
+self_update() {
+    local target_path="${BASH_SOURCE[0]:-}"
+    if [[ -z "$target_path" || ! -f "$target_path" || "$target_path" == /dev/fd/* || "$target_path" == /proc/self/fd/* ]]; then
+        echo -e "${C_GREEN}[提示] 你正在通过远程一键命令运行，每次执行已自动拉取最新版脚本与检测数据库。${C_RESET}"
+        exit 0
+    fi
+
+    echo -e "${C_DIM}正在从 GitHub 拉取最新 ipzhiliang.sh ...${C_RESET}"
+    local tmp_new
+    tmp_new=$(mktemp "${TMPDIR:-/tmp}/ipzhiliang_update.XXXXXX.sh")
+    if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
+        local new_ver
+        new_ver=$(grep -m1 '^VERSION=' "$tmp_new" | cut -d'"' -f2)
+        chmod +x "$tmp_new"
+        mv "$tmp_new" "$target_path"
+        echo -e "${C_GREEN}[成功] 已更新至最新版本 v${new_ver:-unknown} (${target_path})${C_RESET}"
+        exit 0
+    else
+        rm -f "$tmp_new"
+        echo -e "${C_RED}[错误] 自更新失败，请检查网络连接后重试。${C_RESET}"
+        exit 1
+    fi
+}
+
+# 若以本地文件方式运行，轻量检查是否有新版本（2秒超时，不阻塞）
+check_self_update() {
+    local target_path="${BASH_SOURCE[0]:-}"
+    if [[ -z "$target_path" || ! -f "$target_path" || "$target_path" == /dev/fd/* || "$target_path" == /proc/self/fd/* ]]; then
+        return 0
+    fi
+    [[ "$NON_INTERACTIVE" -eq 1 || "$DRY_RUN" -eq 1 ]] && return 0
+
+    local remote_ver
+    remote_ver=$(curl -fsL --connect-timeout 2 --max-time 3 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" 2>/dev/null | grep -m1 '^VERSION=' | cut -d'"' -f2)
+    if [[ -n "$remote_ver" && "$remote_ver" != "$VERSION" ]]; then
+        echo -e "${C_YELLOW}[更新提醒] 检测到新版本 v${remote_ver} (当前 v${VERSION})。${C_RESET}"
+        local do_upd=""
+        tty_read "是否立即自动更新本地脚本并重新运行? [Y/n]: " do_upd
+        if [[ -z "$do_upd" || "$do_upd" =~ ^[Yy]$ ]]; then
+            local tmp_new
+            tmp_new=$(mktemp "${TMPDIR:-/tmp}/ipzhiliang_update.XXXXXX.sh")
+            if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
+                chmod +x "$tmp_new"
+                mv "$tmp_new" "$target_path"
+                echo -e "${C_GREEN}[成功] 已更新至 v${remote_ver}，正在重启脚本...${C_RESET}"
+                echo ""
+                exec bash "$target_path"
+            else
+                rm -f "$tmp_new"
+                echo -e "${C_YELLOW}[提示] 自动更新失败，继续使用当前版本运行。${C_RESET}"
+            fi
+        fi
+        echo ""
+    fi
 }
 
 # 查找可用的 Bash >= 4.0（上游 IP.Check.Place 要求 Bash 4+）
@@ -672,12 +731,20 @@ show_summary() {
 
 download_upstream_script() {
     TMP_SCRIPT=$(mktemp "${TMPDIR:-/tmp}/ipzhiliang.XXXXXX.sh")
-    echo -e "${C_DIM}正在获取最新 IP 质量检测引擎...${C_RESET}"
-    if curl -fsL --connect-timeout 8 --max-time 25 "$UPSTREAM_PRIMARY" -o "$TMP_SCRIPT" 2>/dev/null && [[ -s "$TMP_SCRIPT" ]]; then
+    local ts
+    ts=$(date +%s)
+    echo -e "${C_DIM}正在实时拉取最新 IP 质量检测引擎与数据库...${C_RESET}"
+    if curl -fsL --connect-timeout 8 --max-time 25 -H "Cache-Control: no-cache" -H "Pragma: no-cache" "$UPSTREAM_PRIMARY" -o "$TMP_SCRIPT" 2>/dev/null && [[ -s "$TMP_SCRIPT" ]]; then
+        local up_ver
+        up_ver=$(grep -m1 '^script_version=' "$TMP_SCRIPT" | cut -d'"' -f2)
+        [[ -n "$up_ver" ]] && echo -e "${C_GREEN}[已同步] 上游检测引擎版本: ${up_ver} (IP.Check.Place 实时最新)${C_RESET}"
         return 0
     fi
     echo -e "${C_YELLOW}主源下载超时，正在切换至 GitHub 备用源...${C_RESET}"
-    if curl -fsL --connect-timeout 10 --max-time 30 "$UPSTREAM_FALLBACK" -o "$TMP_SCRIPT" 2>/dev/null && [[ -s "$TMP_SCRIPT" ]]; then
+    if curl -fsL --connect-timeout 10 --max-time 30 -H "Cache-Control: no-cache" "${UPSTREAM_FALLBACK}?t=${ts}" -o "$TMP_SCRIPT" 2>/dev/null && [[ -s "$TMP_SCRIPT" ]]; then
+        local up_ver
+        up_ver=$(grep -m1 '^script_version=' "$TMP_SCRIPT" | cut -d'"' -f2)
+        [[ -n "$up_ver" ]] && echo -e "${C_GREEN}[已同步] 上游检测引擎版本: ${up_ver} (GitHub 备用源)${C_RESET}"
         return 0
     fi
     echo -e "${C_RED}[错误] 无法下载上游检测脚本，请检查网络连接。${C_RESET}"
@@ -810,6 +877,9 @@ parse_cli_args() {
                 DEP_MODE="skip"
                 shift
                 ;;
+            --update)
+                self_update
+                ;;
             --dry-run)
                 DRY_RUN=1
                 shift
@@ -903,6 +973,7 @@ main() {
     parse_cli_args "$@"
     check_env
     print_banner
+    check_self_update
 
     if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
         show_summary
