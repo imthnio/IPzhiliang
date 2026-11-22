@@ -1,7 +1,7 @@
 #!/bin/sh
 # ==============================================================================
 # IPzhiliang 通用自举入口脚本 (POSIX sh)
-# 自动识别系统 (Alpine / Debian / Ubuntu / CentOS / Rocky / Arch / macOS)
+# 自动识别系统 (Alpine / Debian / Ubuntu / CentOS / Rocky / Arch / OpenWrt / FreeBSD / macOS)
 # 自动补齐 bash (>=4.0) 与 curl，再拉取并运行最新 ipzhiliang.sh
 # ==============================================================================
 
@@ -15,7 +15,8 @@ cleanup() {
         rm -f "$TMP_MAIN"
     fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 # 检测是否需要 sudo
 SUDO=""
@@ -99,14 +100,19 @@ BASH4_BIN=$(find_bash4) || {
     exit 1
 }
 
-# 2. 创建兼容 BusyBox / GNU / macOS 的临时文件并拉取最新主脚本
+# 2. 创建兼容 BusyBox / GNU / macOS 的安全临时文件 (0600 权限) 并拉取最新主脚本
+OLD_UMASK=$(umask)
+umask 077
 if command -v mktemp >/dev/null 2>&1; then
     TMP_MAIN=$(mktemp "${TMPDIR:-/tmp}/ipzhiliang_main.XXXXXX" 2>/dev/null) || TMP_MAIN=""
 fi
 if [ -z "$TMP_MAIN" ]; then
     TMP_MAIN="${TMPDIR:-/tmp}/ipzhiliang_main.$$"
+    rm -f "$TMP_MAIN" 2>/dev/null || true
     : > "$TMP_MAIN"
 fi
+chmod 600 "$TMP_MAIN" 2>/dev/null || true
+umask "$OLD_UMASK"
 
 TS=$(date +%s)
 if command -v curl >/dev/null 2>&1; then
@@ -118,13 +124,14 @@ else
     exit 1
 fi
 
-if [ ! -s "$TMP_MAIN" ]; then
-    printf "\033[31m[错误] 下载 ipzhiliang.sh 失败，请检查网络连接。\033[0m\n"
+if [ ! -s "$TMP_MAIN" ] || ! grep -q "IPzhiliang" "$TMP_MAIN" 2>/dev/null; then
+    printf "\033[31m[错误] 下载或校验 ipzhiliang.sh 失败，请检查网络连接。\033[0m\n"
     exit 1
 fi
 
-# 3. 使用 Bash 4+ 运行主脚本（确保绑定终端输入）
-if [ -r /dev/tty ]; then
+# 3. 使用 Bash 4+ 运行主脚本（标记已由自举脚本拉取最新版，避免重复检查自更新；安全检测控制终端）
+export IPZHILIANG_BOOTSTRAPPED=1
+if (: </dev/tty) 2>/dev/null; then
     "$BASH4_BIN" "$TMP_MAIN" "$@" </dev/tty
 else
     "$BASH4_BIN" "$TMP_MAIN" "$@"

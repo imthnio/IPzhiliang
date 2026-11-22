@@ -7,7 +7,7 @@
 
 set -u
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
 UPSTREAM_PRIMARY="https://IP.Check.Place"
 UPSTREAM_FALLBACK="https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh"
@@ -37,37 +37,52 @@ DRY_RUN=0                  # 仅展示命令不执行
 NON_INTERACTIVE=0          # CLI 直通模式
 
 TMP_SCRIPT=""
+TMP_CURL_CFG=""
 
 cleanup() {
+    if [[ -n "$TMP_CURL_CFG" && -f "$TMP_CURL_CFG" ]]; then
+        rm -f "$TMP_CURL_CFG"
+    fi
     if [[ -n "$TMP_SCRIPT" && -f "$TMP_SCRIPT" ]]; then
-        rm -f "$TMP_SCRIPT"
+        rm -f "$TMP_SCRIPT" "${TMP_SCRIPT}.patched"
     fi
 }
 trap cleanup EXIT
-trap 'echo -e "\n${C_YELLOW}已取消检测。${C_RESET}"; exit 130' INT TERM
+trap 'cleanup; echo -e "\n${C_YELLOW}已取消检测。${C_RESET}"; exit 130' INT TERM
+
+# 检测当前进程是否拥有真正可打开的控制终端（修复无 TTY 会话下 [ -r /dev/tty ] 误判为真导致崩溃的问题）
+has_controlling_tty() {
+    (: </dev/tty) 2>/dev/null
+}
 
 # 兼容 `bash <(curl ...)` 和 `curl ... | bash` 的安全读取函数
-# 注意：内部变量使用 __tty_ 前缀，避免与调用方传入的变量名冲突
+# 注意：内部变量使用 __tty_ 前缀，避免与调用方传入的变量名冲突；处理 EOF 防止死循环
 tty_read() {
     local __tty_prompt="$1"
     local __tty_var="$2"
     local __tty_silent="${3:-0}"
     local __tty_val=""
+    local __tty_rc=0
 
-    if [[ -r /dev/tty ]]; then
+    if has_controlling_tty; then
         if [[ "$__tty_silent" == "1" ]]; then
-            read -r -s -p "$__tty_prompt" __tty_val </dev/tty
+            read -r -s -p "$__tty_prompt" __tty_val </dev/tty || __tty_rc=$?
             echo "" >/dev/tty
         else
-            read -r -p "$__tty_prompt" __tty_val </dev/tty
+            read -r -p "$__tty_prompt" __tty_val </dev/tty || __tty_rc=$?
         fi
     else
         if [[ "$__tty_silent" == "1" ]]; then
-            read -r -s -p "$__tty_prompt" __tty_val
-            echo ""
+            read -r -s -p "$__tty_prompt" __tty_val || __tty_rc=$?
+            echo "" >&2
         else
-            read -r -p "$__tty_prompt" __tty_val
+            read -r -p "$__tty_prompt" __tty_val || __tty_rc=$?
         fi
+    fi
+
+    if [[ $__tty_rc -ne 0 && -z "$__tty_val" ]]; then
+        echo -e "\n${C_YELLOW}输入流已结束 (EOF)，已安全退出。${C_RESET}" >&2
+        exit 0
     fi
 
     printf -v "$__tty_var" '%s' "$__tty_val"
@@ -92,24 +107,27 @@ detect_host_env() {
         virt_type="OpenVZ(小鸡)"
     elif grep -qaE 'lxc|kubepods' /proc/1/cgroup 2>/dev/null || [[ "${container:-}" == "lxc" ]]; then
         virt_type="LXC容器(小鸡)"
-    elif command -v systemd-detect-virt >/dev/null 2>&1; then
-        local v
-        v=$(systemd-detect-virt 2>/dev/null || true)
-        if [[ -n "$v" && "$v" != "none" ]]; then
-            virt_type="${v}(小鸡)"
+    else
+        if command -v systemd-detect-virt >/dev/null 2>&1; then
+            local v
+            v=$(systemd-detect-virt 2>/dev/null || true)
+            if [[ -n "$v" && "$v" != "none" ]]; then
+                virt_type="${v}(小鸡)"
+            fi
         fi
-    elif [[ -r /sys/class/dmi/id/product_name ]]; then
-        local prod
-        prod=$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)
-        case "$prod" in
-            *KVM*|*QEMU*) virt_type="KVM(小鸡)" ;;
-            *VMware*) virt_type="VMware(小鸡)" ;;
-            *VirtualBox*) virt_type="VirtualBox(小鸡)" ;;
-            *Xen*) virt_type="Xen(小鸡)" ;;
-            *Hyper-V*|*"Virtual Machine"*) virt_type="Hyper-V(小鸡)" ;;
-        esac
-    elif [[ "$(uname -s)" == "Darwin" ]]; then
-        virt_type="macOS本机"
+        if [[ "$virt_type" == "物理机(母鸡)" && -r /sys/class/dmi/id/product_name ]]; then
+            local prod
+            prod=$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)
+            case "$prod" in
+                *KVM*|*QEMU*) virt_type="KVM(小鸡)" ;;
+                *VMware*) virt_type="VMware(小鸡)" ;;
+                *VirtualBox*) virt_type="VirtualBox(小鸡)" ;;
+                *Xen*) virt_type="Xen(小鸡)" ;;
+                *Hyper-V*|*"Virtual Machine"*) virt_type="Hyper-V(小鸡)" ;;
+            esac
+        elif [[ "$(uname -s)" == "Darwin" ]]; then
+            virt_type="macOS本机"
+        fi
     fi
 
     echo "${os_name} · ${virt_type}"
@@ -149,7 +167,7 @@ IPzhiliang v${VERSION} - IP 质量交互式一键检测脚本
   -6                 仅检测 IPv6
   -l <语言>          报告语言: cn | en | jp | es | de | fr | ru | pt (默认 cn)
   -E                 英文报告 (等同于 -l en)
-  -o <路径>          将报告保存到本地文件 (.txt / .ansi / .json)
+  -o <路径>          将报告保存到本地文件 (.txt / .ansi / .json，自动设置 0600 隐私权限)
   -j                 以 JSON 格式输出
   -y                 自动安装缺失依赖 [默认]
   -n                 跳过系统与依赖检测
@@ -159,24 +177,39 @@ IPzhiliang v${VERSION} - IP 质量交互式一键检测脚本
 EOF
 }
 
-# 兼容 GNU / BusyBox(Alpine) / macOS 的安全临时文件创建函数
+# 兼容 GNU / BusyBox(Alpine) / macOS 的安全临时文件创建函数（强制 0600 权限防同机其他用户窥探）
 make_temp_file() {
     local prefix="${1:-ipzhiliang}"
     local f=""
+    local old_umask
+    old_umask=$(umask)
+    umask 077
     if command -v mktemp >/dev/null 2>&1; then
         f=$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null) || f=""
     fi
     if [[ -z "$f" ]]; then
         f="${TMPDIR:-/tmp}/${prefix}.$$.${RANDOM:-0}"
+        rm -f "$f" 2>/dev/null || true
         : > "$f"
     fi
+    chmod 600 "$f" 2>/dev/null || true
+    umask "$old_umask"
     echo "$f"
+}
+
+# 判断当前脚本是否属于远程流或 run.sh 引导的临时文件
+is_ephemeral_script_path() {
+    local p="${1:-}"
+    if [[ -z "$p" || ! -f "$p" || "$p" == /dev/fd/* || "$p" == /proc/self/fd/* || "$p" == */ipzhiliang_main.* || "${IPZHILIANG_BOOTSTRAPPED:-0}" == "1" ]]; then
+        return 0
+    fi
+    return 1
 }
 
 # 本地脚本自更新
 self_update() {
     local target_path="${BASH_SOURCE[0]:-}"
-    if [[ -z "$target_path" || ! -f "$target_path" || "$target_path" == /dev/fd/* || "$target_path" == /proc/self/fd/* ]]; then
+    if is_ephemeral_script_path "$target_path"; then
         echo -e "${C_GREEN}[提示] 你正在通过远程一键命令运行，每次执行已自动拉取最新版脚本与检测数据库。${C_RESET}"
         exit 0
     fi
@@ -187,10 +220,15 @@ self_update() {
     if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
         local new_ver
         new_ver=$(grep -m1 '^VERSION=' "$tmp_new" | cut -d'"' -f2)
-        chmod +x "$tmp_new"
-        mv "$tmp_new" "$target_path"
-        echo -e "${C_GREEN}[成功] 已更新至最新版本 v${new_ver:-unknown} (${target_path})${C_RESET}"
-        exit 0
+        chmod +x "$tmp_new" 2>/dev/null || true
+        if mv -f "$tmp_new" "$target_path" 2>/dev/null; then
+            echo -e "${C_GREEN}[成功] 已更新至最新版本 v${new_ver:-unknown} (${target_path})${C_RESET}"
+            exit 0
+        else
+            rm -f "$tmp_new"
+            echo -e "${C_RED}[错误] 无法写入 ${target_path}，请检查文件权限（如使用 sudo）。${C_RESET}"
+            exit 1
+        fi
     else
         rm -f "$tmp_new"
         echo -e "${C_RED}[错误] 自更新失败，请检查网络连接后重试。${C_RESET}"
@@ -198,13 +236,15 @@ self_update() {
     fi
 }
 
-# 若以本地文件方式运行，全自动检查并直接静默更新到最新版本（2秒超时，不阻塞）
+# 若以本地文件方式运行，全自动检查并直接静默更新到最新版本（2秒超时，不阻塞，带防递归死循环保护）
 check_self_update() {
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    [[ "${IPZHILIANG_SKIP_UPDATE:-0}" == "1" ]] && return 0
+
     local target_path="${BASH_SOURCE[0]:-}"
-    if [[ -z "$target_path" || ! -f "$target_path" || "$target_path" == /dev/fd/* || "$target_path" == /proc/self/fd/* ]]; then
+    if is_ephemeral_script_path "$target_path"; then
         return 0
     fi
-    [[ "$DRY_RUN" -eq 1 ]] && return 0
 
     local remote_ver
     remote_ver=$(curl -fsL --connect-timeout 2 --max-time 3 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" 2>/dev/null | grep -m1 '^VERSION=' | cut -d'"' -f2)
@@ -213,11 +253,18 @@ check_self_update() {
         local tmp_new
         tmp_new=$(make_temp_file "ipzhiliang_update")
         if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
-            chmod +x "$tmp_new"
-            mv "$tmp_new" "$target_path"
-            echo -e "${C_GREEN}[自动更新] 已更新至 v${remote_ver}，正在无缝启动新版...${C_RESET}"
-            echo ""
-            exec bash "$target_path" "$@"
+            local downloaded_ver
+            downloaded_ver=$(grep -m1 '^VERSION=' "$tmp_new" | cut -d'"' -f2)
+            chmod +x "$tmp_new" 2>/dev/null || true
+            if [[ -n "$downloaded_ver" && "$downloaded_ver" != "$VERSION" ]] && mv -f "$tmp_new" "$target_path" 2>/dev/null; then
+                echo -e "${C_GREEN}[自动更新] 已更新至 v${downloaded_ver}，正在无缝启动新版...${C_RESET}"
+                echo ""
+                export IPZHILIANG_SKIP_UPDATE=1
+                exec "${BASH4_BIN:-${BASH:-bash}}" "$target_path" "$@"
+            else
+                rm -f "$tmp_new"
+                echo -e "${C_YELLOW}[提示] 自动更新写入失败或版本未变更，继续使用当前版本运行。${C_RESET}"
+            fi
         else
             rm -f "$tmp_new"
             echo -e "${C_YELLOW}[提示] 自动更新拉取失败，继续使用当前版本运行。${C_RESET}"
@@ -263,76 +310,247 @@ check_env() {
     fi
 }
 
-# 隐藏代理 URL 中的密码用于屏幕显示
+# 判断字符串是否为合法 IPv4 字面量
+is_ipv4_literal() {
+    local ip="$1"
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS='.'
+        local -a octets=($ip)
+        local o
+        for o in "${octets[@]}"; do
+            if (( 10#$o < 0 || 10#$o > 255 )); then
+                return 1
+            fi
+        done
+        return 0
+    fi
+    return 1
+}
+
+# 判断字符串是否为合法 IPv6 字面量
+is_ipv6_literal() {
+    local ip="${1%%/*}"
+    ip="${ip%%%*}"
+    [[ "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:.]+$ ]]
+}
+
+# 判断字符串是否为合法 IPv4 或 IPv6 地址
+is_valid_ip_literal() {
+    is_ipv4_literal "$1" || is_ipv6_literal "$1"
+}
+
+# 判断是否为本地回环地址
+is_loopback_host() {
+    local h="${1#[}"
+    h="${h%]}"
+    [[ "$h" == "127."* || "$h" == "localhost" || "$h" == "::1" || "$h" == "0.0.0.0" || "$h" == "::" || "$h" == "*" ]]
+}
+
+# 对代理用户名或密码进行安全 URL 编码（保留已有的 %XX 转义，防止密码含 @ : / # ? 等特殊字符导致 curl 报错）
+urlencode_cred() {
+    local LC_ALL=C
+    local str="$1"
+    local i c
+    local out=""
+    for (( i=0; i<${#str}; i++ )); do
+        c="${str:i:1}"
+        if [[ "$c" == "%" && "${str:i+1:2}" =~ ^[0-9a-fA-F]{2}$ ]]; then
+            out+="${str:i:3}"
+            i=$((i + 2))
+            continue
+        fi
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# 规范化用户直接输入的代理地址中的认证信息（若密码包含未编码的 @ 或 :，自动完成 URL 编码）
+normalize_proxy_auth() {
+    local url="$1"
+    if [[ "$url" != *"@"* ]]; then
+        printf '%s' "$url"
+        return
+    fi
+
+    local proto_prefix=""
+    local rest="$url"
+    if [[ "$url" == *"://"* ]]; then
+        proto_prefix="${url%%://*}://"
+        rest="${url#*://}"
+    fi
+
+    # 始终按最后一个 @ 切分凭据与主机地址，防止密码本身包含 @
+    local creds="${rest%@*}"
+    local hostpart="${rest##*@}"
+
+    if [[ "$creds" == *":"* ]]; then
+        local user="${creds%%:*}"
+        local pass="${creds#*:}"
+        printf '%s%s:%s@%s' "$proto_prefix" "$(urlencode_cred "$user")" "$(urlencode_cred "$pass")" "$hostpart"
+    else
+        printf '%s%s@%s' "$proto_prefix" "$(urlencode_cred "$creds")" "$hostpart"
+    fi
+}
+
+# 打码 IPv4/IPv6 用于隐私预览（保留首段与尾段，中间打码：既严防泄露完整 IP，又能清晰区分同 C 段/同前缀下的多出口 IP）
+mask_ip() {
+    local raw="$1"
+    local ip="${raw%%/*}"
+    local suffix=""
+    [[ "$raw" == */* ]] && suffix="/${raw#*/}"
+
+    if [[ "$ip" == *":"* ]]; then
+        local masked6
+        masked6=$(echo "$ip" | awk -F: '{
+            first = ($1 != "" ? $1 : "0")
+            second = ($2 != "" ? $2 : "0")
+            last = ($NF != "" ? $NF : "0")
+            if (NF <= 3) print first":*:"last
+            else print first":"second":*:*:"last
+        }')
+        echo "${masked6}${suffix}"
+    elif [[ "$ip" == *"."* ]]; then
+        local masked4
+        masked4=$(echo "$ip" | awk -F. '{
+            if (NF == 4) print $1".*.*."$4
+            else print $1".*.*.*"
+        }')
+        echo "${masked4}${suffix}"
+    else
+        echo "$raw"
+    fi
+}
+
+# 隐藏代理 URL 中的密码（以及在隐藏 IP 模式下对非本地远程代理服务器公网 IP 进行打码）
 mask_proxy_url() {
     local url="$1"
-    if [[ "$url" == *"@"* ]]; then
-        local proto="${url%%://*}"
-        local rest="${url#*://}"
-        local creds="${rest%%@*}"
-        local hostpart="${rest#*@}"
+    local mask_remote_host="${2:-1}"
+    local proto_prefix=""
+    local rest="$url"
+
+    if [[ "$url" == *"://"* ]]; then
+        proto_prefix="${url%%://*}://"
+        rest="${url#*://}"
+    fi
+
+    local auth_display=""
+    local hostpart="$rest"
+    if [[ "$rest" == *"@"* ]]; then
+        local creds="${rest%@*}"
+        hostpart="${rest##*@}"
         if [[ "$creds" == *":"* ]]; then
             local user="${creds%%:*}"
-            echo "${proto}://${user}:***@${hostpart}"
-            return
+            auth_display="${user}:***"
+        else
+            auth_display="***"
         fi
     fi
-    echo "$url"
-}
 
-# 打码 IPv4/IPv6 用于隐私预览
-mask_ip() {
-    local ip="$1"
-    if [[ "$ip" == *":"* ]]; then
-        # IPv6: 保留前两段
-        echo "$ip" | awk -F: '{print $1":"$2":*:*:*"}'
-    elif [[ "$ip" == *"."* ]]; then
-        # IPv4: 保留前两段
-        echo "$ip" | awk -F. '{print $1"."$2".*.*"}'
+    # 若需要在隐私模式下隐藏远程代理主机公网 IP（保留本地 127.0.0.1 / localhost / ::1 不打码）
+    if [[ "$mask_remote_host" == "1" && ( "$PRIVACY_MODE" == "1" || "$PRIVACY_MODE" == "2" ) ]]; then
+        local host_only="" port_part=""
+        if [[ "$hostpart" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+            host_only="${BASH_REMATCH[1]}"
+            port_part=":${BASH_REMATCH[2]}"
+            if ! is_loopback_host "$host_only" && is_valid_ip_literal "$host_only"; then
+                hostpart="[$(mask_ip "$host_only")]${port_part}"
+            fi
+        elif [[ "$hostpart" =~ ^([^:]+):([0-9]+)$ ]]; then
+            host_only="${BASH_REMATCH[1]}"
+            port_part=":${BASH_REMATCH[2]}"
+            if ! is_loopback_host "$host_only" && is_valid_ip_literal "$host_only"; then
+                hostpart="$(mask_ip "$host_only")${port_part}"
+            fi
+        elif ! is_loopback_host "$hostpart" && is_valid_ip_literal "$hostpart"; then
+            hostpart="$(mask_ip "$hostpart")"
+        fi
+    fi
+
+    if [[ -n "$auth_display" ]]; then
+        echo "${proto_prefix}${auth_display}@${hostpart}"
     else
-        echo "$ip"
+        echo "${proto_prefix}${hostpart}"
     fi
 }
 
-# 检测端口是否在本机监听，并返回监听地址提示
+# 对监听地址如 203.0.113.55:443 中的公网 IP 进行打码，防止端口提示列表泄露本机公网 IP
+mask_listen_addr() {
+    awk '{
+        addr = $1
+        proc = (NF > 1 ? " " $2 : "")
+        # 匹配 [IPv6]:port 或 IPv4:port
+        if (match(addr, /^\[[^\]]+\]:[0-9]+$/)) {
+            sep = index(addr, "]:")
+            host = substr(addr, 2, sep - 2)
+            port = substr(addr, sep + 2)
+            if (host != "::" && host != "::1" && host !~ /^fe80:/ && index(host, ":") > 0) {
+                n = split(host, a, ":")
+                host = (a[1] ? a[1] : "0") ":*:*:" (a[n] ? a[n] : "0")
+            }
+            print "[" host "]:" port proc
+        } else if (match(addr, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/)) {
+            sep = index(addr, ":")
+            host = substr(addr, 1, sep - 1)
+            port = substr(addr, sep + 1)
+            if (host !~ /^127\./ && host != "0.0.0.0") {
+                split(host, a, ".")
+                host = a[1] ".*.*." a[4]
+            }
+            print host ":" port proc
+        } else {
+            print $0
+        }
+    }'
+}
+
+# 检测端口是否在本机监听，并返回监听地址提示（兼容 Linux ss/netstat 与 macOS/FreeBSD lsof）
 check_local_port_listen() {
     local port="$1"
+    local out=""
     if command -v ss >/dev/null 2>&1; then
-        ss -tuln 2>/dev/null | grep -E ":${port}([[:space:]]|$)" | head -n 3
-    elif command -v netstat >/dev/null 2>&1; then
-        netstat -tuln 2>/dev/null | grep -E "[:.]${port}([[:space:]]|$)" | head -n 3
-    elif command -v lsof >/dev/null 2>&1; then
-        lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | tail -n +2 | head -n 3
+        out=$(ss -tuln 2>/dev/null | grep -E ":${port}([[:space:]]|$)" | head -n 3 || true)
     fi
+    if [[ -z "$out" ]] && command -v netstat >/dev/null 2>&1; then
+        out=$(netstat -tuln 2>/dev/null | grep -E "[:.]${port}([[:space:]]|$)" | head -n 3 || true)
+    fi
+    if [[ -z "$out" ]] && command -v lsof >/dev/null 2>&1; then
+        out=$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | tail -n +2 | head -n 3 || true)
+    fi
+    [[ -n "$out" ]] && echo "$out"
 }
 
-# 列出本机正在监听的常用本地端口（辅助用户参考）
+# 列出本机正在监听的常用本地端口（辅助用户参考，自动去重并脱敏绑定的公网 IP）
 show_listening_ports_hint() {
     local lines=""
     if command -v ss >/dev/null 2>&1; then
-        lines=$(ss -tulnp 2>/dev/null | awk 'NR>1 && $1 ~ /tcp/ {print $5, $7}' | head -n 12)
-    elif command -v netstat >/dev/null 2>&1; then
-        lines=$(netstat -tuln 2>/dev/null | awk 'NR>2 && $1 ~ /tcp/ {print $4}' | head -n 12)
-    elif command -v lsof >/dev/null 2>&1; then
-        lines=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $9, $1}' | head -n 12)
+        lines=$(ss -tulnp 2>/dev/null | awk 'NR>1 && $1 ~ /tcp/ {print $5, $7}' | awk '!seen[$0]++' | head -n 12 || true)
+    fi
+    if [[ -z "$lines" ]] && command -v netstat >/dev/null 2>&1; then
+        lines=$(netstat -tuln 2>/dev/null | awk 'NR>2 && $1 ~ /tcp/ {print $4}' | awk '!seen[$0]++' | head -n 12 || true)
+    fi
+    if [[ -z "$lines" ]] && command -v lsof >/dev/null 2>&1; then
+        lines=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $9, $1}' | awk '!seen[$0]++' | head -n 12 || true)
     fi
 
     if [[ -n "$lines" ]]; then
         echo -e "${C_DIM}当前本机部分监听端口参考:${C_RESET}"
-        echo "$lines" | sed 's/^/  /'
+        echo "$lines" | mask_listen_addr | awk '!seen[$0]++' | sed 's/^/  /'
         echo ""
     fi
 }
 
-# 通过指定代理探测出口 IP
+# 通过指定代理探测出口 IP（使用 curl -K - 从标准输入传入代理，防止 ps aux 泄露代理密码；校验返回值为合法 IP）
 probe_proxy_ip() {
     local proxy_url="$1"
     local ip=""
-    local endpoints=("https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com")
+    local endpoints=("https://api64.ipify.org" "https://myip.check.place" "https://icanhazip.com" "https://ifconfig.me/ip")
     local ep
     for ep in "${endpoints[@]}"; do
-        ip=$(curl -x "$proxy_url" -fsL --connect-timeout 4 --max-time 6 "$ep" 2>/dev/null | tr -d '[:space:]')
-        if [[ -n "$ip" && ${#ip} -le 45 ]]; then
+        ip=$(printf 'proxy = "%s"\n' "$proxy_url" | curl -K - -fsL --connect-timeout 4 --max-time 6 "$ep" 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$ip" ]] && is_valid_ip_literal "$ip"; then
             echo "$ip"
             return 0
         fi
@@ -342,7 +560,8 @@ probe_proxy_ip() {
 
 # 自动探测纯端口或 host:port 的代理协议 (socks5h -> http -> https)
 resolve_port_to_proxy() {
-    local raw="$1"
+    local raw
+    raw=$(normalize_proxy_auth "$1")
     local auth_prefix="${2:-}"
     local hostport=""
     local probed_ip=""
@@ -355,7 +574,7 @@ resolve_port_to_proxy() {
             echo "$raw"
             return 0
         else
-            echo -e "${C_YELLOW}[警告] 暂未能通过 $(mask_proxy_url "$raw") 获取出口 IP（可能是网络较慢或仅支持 IPv6）。${C_RESET}" >&2
+            echo -e "${C_YELLOW}[警告] 暂未能通过 $(mask_proxy_url "$raw") 获取出口 IP（可能是网络较慢或代理未就绪）。${C_RESET}" >&2
             echo "$raw"
             return 2
         fi
@@ -363,7 +582,7 @@ resolve_port_to_proxy() {
 
     # 纯端口号 -> 补全 127.0.0.1:PORT
     if [[ "$raw" =~ ^[0-9]+$ ]]; then
-        if (( raw < 1 || raw > 65535 )); then
+        if (( 10#$raw < 1 || 10#$raw > 65535 )); then
             echo -e "${C_RED}[错误] 端口号必须在 1-65535 之间: $raw${C_RESET}" >&2
             return 1
         fi
@@ -374,10 +593,20 @@ resolve_port_to_proxy() {
             echo -e "${C_YELLOW}[提示] 未在本地监听列表中发现端口 ${raw}，仍将尝试连接 127.0.0.1:${raw}...${C_RESET}" >&2
         fi
     else
+        # 校验形如 host:port 末尾的端口范围
+        if [[ "$raw" =~ :([0-9]+)$ ]]; then
+            local extracted_port="${BASH_REMATCH[1]}"
+            if (( 10#$extracted_port < 1 || 10#$extracted_port > 65535 )); then
+                echo -e "${C_RED}[错误] 端口号必须在 1-65535 之间: $extracted_port${C_RESET}" >&2
+                return 1
+            fi
+        fi
         hostport="$raw"
     fi
 
-    echo -e "${C_DIM}正在自动探测 ${hostport} 的代理协议 (SOCKS5 / HTTP / HTTPS)...${C_RESET}" >&2
+    local masked_hp
+    masked_hp=$(mask_proxy_url "${auth_prefix}${hostport}")
+    echo -e "${C_DIM}正在自动探测 ${masked_hp} 的代理协议 (SOCKS5 / HTTP / HTTPS)...${C_RESET}" >&2
     local proto candidate
     for proto in socks5h http https; do
         candidate="${proto}://${auth_prefix}${hostport}"
@@ -390,12 +619,12 @@ resolve_port_to_proxy() {
         fi
     done
 
-    echo -e "${C_RED}[失败] 无法通过 SOCKS5 / HTTP / HTTPS 连接 ${hostport}。${C_RESET}" >&2
+    echo -e "${C_RED}[失败] 无法通过 SOCKS5 / HTTP / HTTPS 连接 ${masked_hp}。${C_RESET}" >&2
     echo -e "${C_YELLOW}常见原因排查:${C_RESET}" >&2
     echo "  1. 该端口需要用户名/密码认证（请提供账号密码或完整代理 URL）" >&2
     echo "  2. 该端口是 VLESS/VMess/Trojan/SS 等节点入站，并非直接的 SOCKS5/HTTP 代理端口" >&2
     echo "     -> 如需测试该节点出口，可在面板中开一个本地 SOCKS5/HTTP 出站分流端口，或使用【指定网卡/出口 IP】模式" >&2
-    echo "  3. 服务未启动或未监听在 127.0.0.1" >&2
+    echo "  3. 服务未启动或未监听在目标地址" >&2
     return 1
 }
 
@@ -430,6 +659,8 @@ step_select_target() {
         *)
             echo -e "${C_YELLOW}无效选项，默认检测整台机器。${C_RESET}"
             TARGET_MODE="machine"
+            TARGET_PORTS=()
+            TARGET_IFACE=""
             ;;
     esac
     echo ""
@@ -469,7 +700,7 @@ configure_port_target() {
                 tty_read "请输入代理用户名: " p_user
                 tty_read "请输入代理密码 (输入不回显): " p_pass 1
                 if [[ -n "$p_user" ]]; then
-                    auth_prefix="${p_user}:${p_pass}@"
+                    auth_prefix="$(urlencode_cred "$p_user"):$(urlencode_cred "$p_pass")@"
                 fi
             fi
         fi
@@ -482,6 +713,19 @@ configure_port_target() {
 
         for item in "${items[@]}"; do
             [[ -z "$item" ]] && continue
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                local norm_item
+                norm_item=$(normalize_proxy_auth "$item")
+                if [[ "$norm_item" =~ ^(socks5h?|socks4a?|https?):// ]]; then
+                    TARGET_PORTS+=("$norm_item")
+                elif [[ "$norm_item" =~ ^[0-9]+$ ]]; then
+                    TARGET_PORTS+=("socks5h://${auth_prefix}127.0.0.1:${norm_item}")
+                else
+                    TARGET_PORTS+=("socks5h://${auth_prefix}${norm_item}")
+                fi
+                continue
+            fi
+
             resolved=$(resolve_port_to_proxy "$item" "$auth_prefix")
             rc=$?
             if [[ $rc -eq 0 ]]; then
@@ -493,6 +737,7 @@ configure_port_target() {
                     TARGET_PORTS+=("$resolved")
                 else
                     all_ok=0
+                    break
                 fi
             else
                 # 探测失败，允许用户手动指定协议强行测试
@@ -505,10 +750,12 @@ configure_port_target() {
                         local m_proto=""
                         tty_read "请输入协议 (socks5h / socks5 / http / https，默认 socks5h): " m_proto
                         m_proto="${m_proto:-socks5h}"
-                        if [[ "$item" =~ ^[0-9]+$ ]]; then
-                            TARGET_PORTS+=("${m_proto}://${auth_prefix}127.0.0.1:${item}")
+                        local norm_item
+                        norm_item=$(normalize_proxy_auth "$item")
+                        if [[ "$norm_item" =~ ^[0-9]+$ ]]; then
+                            TARGET_PORTS+=("${m_proto}://${auth_prefix}127.0.0.1:${norm_item}")
                         else
-                            TARGET_PORTS+=("${m_proto}://${auth_prefix}${item}")
+                            TARGET_PORTS+=("${m_proto}://${auth_prefix}${norm_item}")
                         fi
                         ;;
                     3)
@@ -519,6 +766,7 @@ configure_port_target() {
                         ;;
                     *)
                         all_ok=0
+                        break
                         ;;
                 esac
             fi
@@ -532,26 +780,56 @@ configure_port_target() {
 
 configure_iface_target() {
     echo ""
-    local ifaces=()
+    local iface_names=()
+    local iface_ips=()
+    local line if_name if_addr
+
     if command -v ip >/dev/null 2>&1; then
         while IFS= read -r line; do
-            [[ -n "$line" ]] && ifaces+=("$line")
-        done < <(ip -o -4 addr show 2>/dev/null | awk '$2 != "lo" {print $2 " (" $4 ")"}')
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && ifaces+=("$line")
-        done < <(ip -o -6 addr show scope global 2>/dev/null | awk '$2 != "lo" {print $2 " (" $4 ")"}')
+            [[ -z "$line" ]] && continue
+            if_name="${line%% *}"
+            if_addr="${line#* }"
+            iface_names+=("$if_name")
+            iface_ips+=("$if_addr")
+        done < <(
+            ip -o -4 addr show 2>/dev/null | awk '$2 != "lo" {sub(/@.*/, "", $2); print $2, $4}'
+            ip -o -6 addr show scope global 2>/dev/null | awk '$2 != "lo" {sub(/@.*/, "", $2); print $2, $4}'
+        )
     elif command -v ifconfig >/dev/null 2>&1; then
         while IFS= read -r line; do
-            [[ -n "$line" ]] && ifaces+=("$line")
-        done < <(ifconfig 2>/dev/null | awk '/^[a-zA-Z0-9_-]+:/ {iface=$1; sub(":","",iface)} /inet / && iface!="lo" && iface!="lo0" {print iface " (" $2 ")"}')
+            [[ -z "$line" ]] && continue
+            if_name="${line%% *}"
+            if_addr="${line#* }"
+            iface_names+=("$if_name")
+            iface_ips+=("$if_addr")
+        done < <(
+            ifconfig 2>/dev/null | awk '
+                /^[a-zA-Z0-9_.-]+:?[[:space:]]/ {
+                    iface = $1
+                    sub(/:$/, "", iface)
+                }
+                /inet / && iface != "lo" && iface != "lo0" {
+                    addr = $2
+                    sub(/^addr:/, "", addr)
+                    print iface, addr
+                }
+                /inet6 / && iface != "lo" && iface != "lo0" {
+                    addr = $2
+                    if (addr == "addr:") addr = $3
+                    sub(/%.*/, "", addr)
+                    if (addr !~ /^fe80:/ && addr != "::1") print iface, addr
+                }
+            '
+        )
     fi
 
-    if [[ ${#ifaces[@]} -gt 0 ]]; then
-        echo -e "${C_CYAN}检测到本机以下网卡与地址：${C_RESET}"
+    if [[ ${#iface_ips[@]} -gt 0 ]]; then
+        echo -e "${C_CYAN}检测到本机以下网卡与出口地址（已自动隐私脱敏显示）：${C_RESET}"
         local idx=1
-        local entry
-        for entry in "${ifaces[@]}"; do
-            echo -e "  ${C_GREEN}${idx})${C_RESET} ${entry}"
+        local i masked_addr
+        for (( i=0; i<${#iface_ips[@]}; i++ )); do
+            masked_addr=$(mask_ip "${iface_ips[$i]}")
+            echo -e "  ${C_GREEN}${idx})${C_RESET} ${iface_names[$i]} (${masked_addr})"
             idx=$((idx + 1))
         done
         echo ""
@@ -569,21 +847,31 @@ configure_iface_target() {
             echo -e "${C_YELLOW}输入不能为空。${C_RESET}"
             continue
         fi
-        if [[ "$iface_input" =~ ^[0-9]+$ ]] && (( iface_input >= 1 && iface_input <= ${#ifaces[@]} )); then
-            local selected="${ifaces[$((iface_input - 1))]}"
-            # 提取括号里的具体 IP（去掉 /前缀），多 IP 网卡可直接精准绑定到选中的那个 IP
-            local extracted_ip
-            extracted_ip=$(echo "$selected" | sed -E 's/.*\(([^)/]+)(\/[0-9]+)?\).*/\1/')
-            if [[ -n "$extracted_ip" && "$extracted_ip" != "$selected" ]]; then
-                TARGET_IFACE="$extracted_ip"
-            else
-                TARGET_IFACE="${selected%% *}"
-            fi
+        if [[ "$iface_input" =~ ^[0-9]+$ ]] && (( 10#$iface_input >= 1 && 10#$iface_input <= ${#iface_ips[@]} )); then
+            local raw_selected_ip="${iface_ips[$((10#$iface_input - 1))]}"
+            # 去掉 /CIDR 前缀，直接精准绑定到所选的具体出口 IP
+            TARGET_IFACE="${raw_selected_ip%%/*}"
         else
-            TARGET_IFACE="$iface_input"
+            TARGET_IFACE="${iface_input%%/*}"
         fi
         break
     done
+}
+
+# 若 TARGET_IFACE 是具体 IPv4 或 IPv6 字面量，自动对齐 IP_STACK 防止协议栈与出口 IP 类型冲突
+align_iface_ip_stack() {
+    [[ "$TARGET_MODE" != "iface" || -z "$TARGET_IFACE" ]] && return 0
+    if is_ipv4_literal "$TARGET_IFACE"; then
+        if [[ "$IP_STACK" == "6" ]]; then
+            echo -e "${C_YELLOW}[提示] 检测到所选出口 ($(mask_ip "$TARGET_IFACE")) 为 IPv4 地址，已自动切换为仅检测 IPv4 (-4)。${C_RESET}"
+        fi
+        IP_STACK="4"
+    elif is_ipv6_literal "$TARGET_IFACE"; then
+        if [[ "$IP_STACK" == "4" ]]; then
+            echo -e "${C_YELLOW}[提示] 检测到所选出口 ($(mask_ip "$TARGET_IFACE")) 为 IPv6 地址，已自动切换为仅检测 IPv6 (-6)。${C_RESET}"
+        fi
+        IP_STACK="6"
+    fi
 }
 
 # 交互步骤 2：选择隐私与公开模式
@@ -609,6 +897,20 @@ step_select_privacy() {
 
 # 交互步骤 3：选择 IP 协议栈
 step_select_ip_stack() {
+    if [[ "$TARGET_MODE" == "iface" && -n "$TARGET_IFACE" ]]; then
+        if is_ipv4_literal "$TARGET_IFACE"; then
+            IP_STACK="4"
+            echo -e "${C_BOLD}${C_BLUE}[3/3] IP 协议版本：${C_RESET}已指定 IPv4 出口地址，自动锁定为 ${C_GREEN}仅检测 IPv4 (-4)${C_RESET}"
+            echo ""
+            return
+        elif is_ipv6_literal "$TARGET_IFACE"; then
+            IP_STACK="6"
+            echo -e "${C_BOLD}${C_BLUE}[3/3] IP 协议版本：${C_RESET}已指定 IPv6 出口地址，自动锁定为 ${C_GREEN}仅检测 IPv6 (-6)${C_RESET}"
+            echo ""
+            return
+        fi
+    fi
+
     echo -e "${C_BOLD}${C_BLUE}[3/3] 请选择检测的 IP 协议版本：${C_RESET}"
     echo -e "  ${C_GREEN}1)${C_RESET} 双栈检测 (IPv4 + IPv6) ${C_DIM}[默认]${C_RESET}"
     echo -e "  ${C_GREEN}2)${C_RESET} 仅检测 IPv4 ${C_DIM}(-4)${C_RESET}"
@@ -626,6 +928,20 @@ step_select_ip_stack() {
     echo ""
 }
 
+# 校验并标准化语言代码（兼容用户输入 zh / ja / en-us 等常见写法）
+normalize_lang_code() {
+    local code
+    code=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    case "$code" in
+        cn|zh|zh-cn|zh_cn|chs) echo "cn" ;;
+        en|en-us|en_us|eng)    echo "en" ;;
+        jp|ja|ja-jp|ja_jp)     echo "jp" ;;
+        es|de|fr|ru|pt)        echo "$code" ;;
+        *)                     return 1 ;;
+    esac
+    return 0
+}
+
 # 可选高级选项菜单
 step_advanced_options() {
     echo ""
@@ -634,10 +950,14 @@ step_advanced_options() {
     # 1. 报告语言
     echo -e "1) 报告语言 (当前: ${C_CYAN}${LANG_CODE}${C_RESET})"
     echo "   可选: cn (中文) | en (English) | jp | es | de | fr | ru | pt"
-    local lang_in=""
+    local lang_in="" norm_lang=""
     tty_read "   请输入语言代码 (直接回车保持 ${LANG_CODE}): " lang_in
     if [[ -n "$lang_in" ]]; then
-        LANG_CODE=$(echo "$lang_in" | tr '[:upper:]' '[:lower:]')
+        if norm_lang=$(normalize_lang_code "$lang_in"); then
+            LANG_CODE="$norm_lang"
+        else
+            echo -e "   ${C_YELLOW}[提示] 不支持的语言代码 '${lang_in}'，保持为 ${LANG_CODE}。${C_RESET}"
+        fi
     fi
 
     # 2. 保存报告到本地文件
@@ -687,7 +1007,7 @@ build_upstream_args() {
     local output_override="${2:-}"
     UPSTREAM_ARGS=()
 
-    # IP 协议栈
+    # IP 协议栈（必须置于 -i / -x 之前，确保 get_opts 先设置 IPV4check/IPV6check）
     [[ "$IP_STACK" == "4" ]] && UPSTREAM_ARGS+=("-4")
     [[ "$IP_STACK" == "6" ]] && UPSTREAM_ARGS+=("-6")
 
@@ -726,28 +1046,58 @@ build_upstream_args() {
     [[ "$DEP_MODE" == "skip" ]] && UPSTREAM_ARGS+=("-n")
 }
 
+# 根据当前隐私模式格式化网卡/出口 IP 用于屏幕显示
+format_iface_display() {
+    local val="$1"
+    if [[ ( "$PRIVACY_MODE" == "1" || "$PRIVACY_MODE" == "2" ) ]] && is_valid_ip_literal "$val"; then
+        mask_ip "$val"
+    else
+        echo "$val"
+    fi
+}
+
 # 生成安全脱敏后的命令预览字符串
 format_preview_cmd() {
     local preview="bash <(curl -Ls https://IP.Check.Place)"
-    local skip_next=0
+    local next_type=""
     local arg
     for arg in "${UPSTREAM_ARGS[@]}"; do
-        if [[ $skip_next -eq 1 ]]; then
+        if [[ "$next_type" == "proxy" ]]; then
             preview+=" '$(mask_proxy_url "$arg")'"
-            skip_next=0
+            next_type=""
+            continue
+        elif [[ "$next_type" == "iface" ]]; then
+            preview+=" '$(format_iface_display "$arg")'"
+            next_type=""
+            continue
+        elif [[ "$next_type" == "out" ]]; then
+            preview+=" '$arg'"
+            next_type=""
             continue
         fi
-        if [[ "$arg" == "-x" ]]; then
-            preview+=" -x"
-            skip_next=1
-        else
-            preview+=" $arg"
-        fi
+        case "$arg" in
+            -x)
+                preview+=" -x"
+                next_type="proxy"
+                ;;
+            -i)
+                preview+=" -i"
+                next_type="iface"
+                ;;
+            -o)
+                preview+=" -o"
+                next_type="out"
+                ;;
+            *)
+                preview+=" $arg"
+                ;;
+        esac
     done
     echo "$preview"
 }
 
 show_summary() {
+    align_iface_ip_stack
     echo -e "${C_BOLD}${C_CYAN}====================== 检测配置总览 ======================${C_RESET}"
     case "$TARGET_MODE" in
         machine)
@@ -762,7 +1112,7 @@ show_summary() {
             echo -e "  检测目标: ${C_GREEN}指定端口/代理 (${#TARGET_PORTS[@]} 个)${C_RESET} -> ${masked_list[*]}"
             ;;
         iface)
-            echo -e "  检测目标: ${C_GREEN}指定网卡/出口 IP${C_RESET} -> ${TARGET_IFACE}"
+            echo -e "  检测目标: ${C_GREEN}指定网卡/出口 IP${C_RESET} -> $(format_iface_display "$TARGET_IFACE")"
             ;;
     esac
 
@@ -795,22 +1145,119 @@ show_summary() {
     echo -e "${C_BOLD}${C_CYAN}==========================================================${C_RESET}"
 }
 
+# 对拉取到的上游脚本实施隐私加固与缺陷修复（语法校验通过后生效，100% 向后兼容）
+patch_upstream_script() {
+    local script_file="$1"
+    local patched_file="${script_file}.patched"
+    local no_upload="0"
+    [[ "$PRIVACY_MODE" == "1" || "$PRIVACY_MODE" == "4" ]] && no_upload="1"
+
+    awk -v privacy_no_upload="$no_upload" '
+    # 1. 进度条隐藏完整 IP（非 -f 模式下使用 $IPhide，彻底杜绝检测过程中终端实时进度条泄露完整 IP）
+    /echo -ne "\\r\$Font_Cyan\$Font_B\[\$IP\]#/ {
+        gsub(/\[\$IP\]#/, "[$(if [ $fullIP -eq 1 ]; then echo \"$IP\"; else echo \"${IPhide:-$IP}\"; fi)]#")
+    }
+    # 2. check_connectivity 走代理/指定网卡 ($CurlARG)，防止旁路裸连泄露宿主机真实 IP
+    /http_code=\$\(curl -s -o \/dev\/null -w "%\{http_code\}" --connect-timeout "\$timeout" "\$url"/ {
+        gsub(/curl -s -o/, "curl $CurlARG -s -o")
+    }
+    # 3. get_ipv4 遵循 -6 (IPV4check=0) 跳过探测，避免多余请求与 IPv4 泄露
+    /^get_ipv4\(\)\{$/ { in_get4 = 1 }
+    in_get4 && /^IPV4=""$/ {
+        print
+        print "[[ $IPV4check -eq 0 ]] && { IPV4work=0; return 0; }"
+        in_get4 = 0
+        next
+    }
+    # 4. get_ipv6 遵循 -4 (IPV6check=0) 跳过探测，避免多余请求与 IPv6 泄露
+    /^get_ipv6\(\)\{$/ { in_get6 = 1 }
+    in_get6 && /^IPV6=""$/ {
+        print
+        print "[[ $IPV6check -eq 0 ]] && { IPV6work=0; return 0; }"
+        in_get6 = 0
+        next
+    }
+    # 5. 修复 macOS/BSD sed 下 hide_ipv6 正则 \+ 不兼容问题
+    /sed \x27s\/::\\\+\/:\/g\x27/ {
+        gsub(/sed \x27s\/::\\\+\/:\/g\x27/, "sed \x27s/::\\{1,\\}/:/g\x27")
+    }
+    # 6. db_ipinfo 拉取 iso3166.json 与 show_ad 走 $CurlARG，避免旁路请求
+    /ISO3166=\$\(curl -sL -m 10 "\$\{rawgithub\}main\/ref\/iso3166\.json"\)/ {
+        gsub(/curl -sL/, "curl $CurlARG -sL")
+    }
+    /content=\$\(curl -fsL --max-time 5 "\$\{rawgithub\}main\/ref\/ad\$i\.ans"\)/ {
+        gsub(/curl -fsL/, "curl $CurlARG -fsL")
+    }
+    /aad\[0\]=\$\(curl -sL --max-time 5 "\$\{rawgithub\}main\/ref\/sponsor\.ans"\)/ {
+        gsub(/curl -sL/, "curl $CurlARG -sL")
+    }
+    # 7. 支持通过 0600 临时配置文件传递代理 (-K)，防止 ps aux 进程表泄露代理账号密码
+    /^usePROXY=" -x \$xproxy"$/ {
+        print "if [[ -n \"${IPZHILIANG_CURL_CFG:-}\" && -f \"${IPZHILIANG_CURL_CFG:-}\" ]]; then usePROXY=\" -K ${IPZHILIANG_CURL_CFG}\"; else usePROXY=\" -x $xproxy\"; fi"
+        next
+    }
+    # 8. get_opts 结尾：仅在未指定 -i / -x 时才按已解析的 -4/-6 探测默认出口 IP
+    /^\[\[ \$IPV4check -eq 1 && \$IPV6check -eq 0 && \$IPV4work -eq 0 \]\]&&ERRORcode=40$/ {
+        print "if [[ -z $useNIC && -z $usePROXY ]]; then get_ipv4; get_ipv6; is_valid_ipv4 $IPV4; is_valid_ipv6 $IPV6; fi"
+    }
+    # 9. 报告上传控制：隐私模式物理级阻断 upload.check.place；公开模式走 $CurlARG
+    /https:\/\/upload\.check\.place/ {
+        if (privacy_no_upload == "1") {
+            print "report_link=\"\""
+            next
+        } else {
+            gsub(/curl -\$2 -s -X POST https:\/\/upload\.check\.place/, "curl $CurlARG -$2 -s -X POST https://upload.check.place")
+        }
+    }
+    # 10. 启动阶段先执行 get_opts 解析 -x/-i/-4/-6，绝不在解析参数前裸连探测宿主机默认 IP
+    /^check_connectivity$/ {
+        skip_pre_init = 1
+        next
+    }
+    skip_pre_init && /^(read_ref|get_ipv4|get_ipv6|is_valid_ipv4 \$IPV4|is_valid_ipv6 \$IPV6)$/ {
+        next
+    }
+    skip_pre_init && /^get_opts "\$@"$/ {
+        print "get_opts \"$@\""
+        print "[[ $ERRORcode -eq 0 ]] && check_connectivity"
+        print "[[ $ERRORcode -eq 0 ]] && read_ref"
+        skip_pre_init = 0
+        next
+    }
+    # 11. 禁用 clear 清屏，防止抹除配置总览及多端口批量检测时的前序报告
+    /^clear$/ {
+        print ": # clear disabled"
+        next
+    }
+    { print }
+    ' "$script_file" > "$patched_file" 2>/dev/null || true
+
+    if [[ -s "$patched_file" ]] && "$BASH4_BIN" -n "$patched_file" 2>/dev/null; then
+        chmod 600 "$patched_file" 2>/dev/null || true
+        mv -f "$patched_file" "$script_file"
+    else
+        rm -f "$patched_file"
+    fi
+}
+
 download_upstream_script() {
     TMP_SCRIPT=$(make_temp_file "ipzhiliang")
     local ts
     ts=$(date +%s)
     echo -e "${C_DIM}正在实时拉取最新 IP 质量检测引擎与数据库...${C_RESET}"
-    if curl -fsL --connect-timeout 8 --max-time 25 -H "Cache-Control: no-cache" -H "Pragma: no-cache" "$UPSTREAM_PRIMARY" -o "$TMP_SCRIPT" 2>/dev/null && [[ -s "$TMP_SCRIPT" ]]; then
+    if curl -fsL --connect-timeout 8 --max-time 25 -H "Cache-Control: no-cache" -H "Pragma: no-cache" "$UPSTREAM_PRIMARY" -o "$TMP_SCRIPT" 2>/dev/null && [[ -s "$TMP_SCRIPT" ]] && grep -q "script_version=" "$TMP_SCRIPT" 2>/dev/null; then
         local up_ver
         up_ver=$(grep -m1 '^script_version=' "$TMP_SCRIPT" | cut -d'"' -f2)
-        [[ -n "$up_ver" ]] && echo -e "${C_GREEN}[已同步] 上游检测引擎版本: ${up_ver} (IP.Check.Place 实时最新)${C_RESET}"
+        patch_upstream_script "$TMP_SCRIPT"
+        [[ -n "$up_ver" ]] && echo -e "${C_GREEN}[已同步] 上游检测引擎版本: ${up_ver} (IP.Check.Place 实时最新 · 已启用隐私加固)${C_RESET}"
         return 0
     fi
     echo -e "${C_YELLOW}主源下载超时，正在切换至 GitHub 备用源...${C_RESET}"
-    if curl -fsL --connect-timeout 10 --max-time 30 -H "Cache-Control: no-cache" "${UPSTREAM_FALLBACK}?t=${ts}" -o "$TMP_SCRIPT" 2>/dev/null && [[ -s "$TMP_SCRIPT" ]]; then
+    if curl -fsL --connect-timeout 10 --max-time 30 -H "Cache-Control: no-cache" "${UPSTREAM_FALLBACK}?t=${ts}" -o "$TMP_SCRIPT" 2>/dev/null && [[ -s "$TMP_SCRIPT" ]] && grep -q "script_version=" "$TMP_SCRIPT" 2>/dev/null; then
         local up_ver
         up_ver=$(grep -m1 '^script_version=' "$TMP_SCRIPT" | cut -d'"' -f2)
-        [[ -n "$up_ver" ]] && echo -e "${C_GREEN}[已同步] 上游检测引擎版本: ${up_ver} (GitHub 备用源)${C_RESET}"
+        patch_upstream_script "$TMP_SCRIPT"
+        [[ -n "$up_ver" ]] && echo -e "${C_GREEN}[已同步] 上游检测引擎版本: ${up_ver} (GitHub 备用源 · 已启用隐私加固)${C_RESET}"
         return 0
     fi
     echo -e "${C_RED}[错误] 无法下载上游检测脚本，请检查网络连接。${C_RESET}"
@@ -835,7 +1282,26 @@ derive_output_path() {
     echo "${stem}_${idx}${ext}"
 }
 
+# 准备导出文件路径：若已存在旧同名文件则先清理（防止上游报错退出码 10）
+prepare_output_file() {
+    local out_path="$1"
+    [[ -z "$out_path" ]] && return 0
+    if [[ -f "$out_path" ]]; then
+        rm -f "$out_path" 2>/dev/null || true
+    fi
+}
+
+# 导出完成后收紧报告文件权限为 0600，防止同机其他非特权用户读取
+secure_output_file() {
+    local out_path="$1"
+    [[ -z "$out_path" ]] && return 0
+    if [[ -f "$out_path" ]]; then
+        chmod 600 "$out_path" 2>/dev/null || true
+    fi
+}
+
 execute_checks() {
+    align_iface_ip_stack
     if [[ "$DRY_RUN" -eq 1 ]]; then
         echo -e "${C_YELLOW}[Dry-Run] 仅预览将执行的命令，不实际运行：${C_RESET}"
         if [[ "$TARGET_MODE" == "port" ]]; then
@@ -857,19 +1323,49 @@ execute_checks() {
 
     if [[ "$TARGET_MODE" == "port" ]]; then
         local i=1 total=${#TARGET_PORTS[@]} p out_path
+        local use_cfg_file=0
+        if grep -q 'IPZHILIANG_CURL_CFG' "$TMP_SCRIPT" 2>/dev/null; then
+            TMP_CURL_CFG=$(make_temp_file "ipzhiliang_curl")
+            use_cfg_file=1
+        fi
+
         for p in "${TARGET_PORTS[@]}"; do
             out_path=$(derive_output_path "$OUTPUT_FILE" "$i" "$total")
-            build_upstream_args "$p" "$out_path"
+            prepare_output_file "$out_path"
             echo ""
             echo -e "${C_BOLD}${C_GREEN}>>> [${i}/${total}] 正在检测端口/代理: $(mask_proxy_url "$p")${C_RESET}"
-            "$BASH4_BIN" "$TMP_SCRIPT" "${UPSTREAM_ARGS[@]}"
+            if [[ $use_cfg_file -eq 1 ]]; then
+                printf 'proxy = "%s"\n' "$p" > "$TMP_CURL_CFG"
+                chmod 600 "$TMP_CURL_CFG" 2>/dev/null || true
+                # 命令行仅传入脱敏后的占位代理字符串，真实代理与密码经由 0600 配置文件读取，彻底杜绝 ps aux 泄露
+                build_upstream_args "$(mask_proxy_url "$p")" "$out_path"
+                IPZHILIANG_CURL_CFG="$TMP_CURL_CFG" "$BASH4_BIN" "$TMP_SCRIPT" "${UPSTREAM_ARGS[@]}"
+            else
+                build_upstream_args "$p" "$out_path"
+                "$BASH4_BIN" "$TMP_SCRIPT" "${UPSTREAM_ARGS[@]}"
+            fi
+            secure_output_file "$out_path"
             i=$((i + 1))
         done
     else
+        prepare_output_file "$OUTPUT_FILE"
         build_upstream_args "" "$OUTPUT_FILE"
         echo ""
         echo -e "${C_BOLD}${C_GREEN}>>> 正在启动 IP 质量检测...${C_RESET}"
         "$BASH4_BIN" "$TMP_SCRIPT" "${UPSTREAM_ARGS[@]}"
+        secure_output_file "$OUTPUT_FILE"
+    fi
+}
+
+# 校验需要参数的 CLI 选项
+require_opt_arg() {
+    local opt_name="$1"
+    local arg_count="$2"
+    local opt_val="${3:-}"
+    if (( arg_count < 2 )) || [[ -z "$opt_val" || "$opt_val" == -* ]]; then
+        echo -e "${C_RED}[错误] 参数 ${opt_name} 需要提供一个有效值。${C_RESET}"
+        echo "使用 --help 查看帮助。"
+        exit 1
     fi
 }
 
@@ -879,16 +1375,33 @@ parse_cli_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --port)
+                require_opt_arg "$1" "$#" "${2:-}"
                 NON_INTERACTIVE=1
                 TARGET_MODE="port"
-                cli_ports="${2:-}"
+                cli_ports="$2"
                 shift 2
                 ;;
+            --port=*)
+                NON_INTERACTIVE=1
+                TARGET_MODE="port"
+                cli_ports="${1#*=}"
+                [[ -z "$cli_ports" ]] && require_opt_arg "--port" 1 ""
+                shift
+                ;;
             --iface)
+                require_opt_arg "$1" "$#" "${2:-}"
                 NON_INTERACTIVE=1
                 TARGET_MODE="iface"
-                TARGET_IFACE="${2:-}"
+                TARGET_IFACE="${2%%/*}"
                 shift 2
+                ;;
+            --iface=*)
+                NON_INTERACTIVE=1
+                TARGET_MODE="iface"
+                TARGET_IFACE="${1#*=}"
+                TARGET_IFACE="${TARGET_IFACE%%/*}"
+                [[ -z "$TARGET_IFACE" ]] && require_opt_arg "--iface" 1 ""
+                shift
                 ;;
             --privacy)
                 NON_INTERACTIVE=1
@@ -916,9 +1429,21 @@ parse_cli_args() {
                 shift
                 ;;
             -l)
+                require_opt_arg "$1" "$#" "${2:-}"
                 NON_INTERACTIVE=1
-                LANG_CODE="${2:-cn}"
+                if ! LANG_CODE=$(normalize_lang_code "$2"); then
+                    echo -e "${C_RED}[错误] 不支持的语言代码: $2 (可选: cn|en|jp|es|de|fr|ru|pt)${C_RESET}"
+                    exit 1
+                fi
                 shift 2
+                ;;
+            -l=*)
+                NON_INTERACTIVE=1
+                if ! LANG_CODE=$(normalize_lang_code "${1#*=}"); then
+                    echo -e "${C_RED}[错误] 不支持的语言代码: ${1#*=} (可选: cn|en|jp|es|de|fr|ru|pt)${C_RESET}"
+                    exit 1
+                fi
+                shift
                 ;;
             -E)
                 NON_INTERACTIVE=1
@@ -926,9 +1451,16 @@ parse_cli_args() {
                 shift
                 ;;
             -o)
+                require_opt_arg "$1" "$#" "${2:-}"
                 NON_INTERACTIVE=1
-                OUTPUT_FILE="${2:-}"
+                OUTPUT_FILE="$2"
                 shift 2
+                ;;
+            -o=*)
+                NON_INTERACTIVE=1
+                OUTPUT_FILE="${1#*=}"
+                [[ -z "$OUTPUT_FILE" ]] && require_opt_arg "-o" 1 ""
+                shift
                 ;;
             -j)
                 NON_INTERACTIVE=1
@@ -981,11 +1513,22 @@ parse_cli_args() {
         fi
         local IFS=','
         local items=($cli_ports)
-        local item resolved rc
+        local item resolved rc norm_item
         for item in "${items[@]}"; do
             [[ -z "$item" ]] && continue
-            if [[ "$DRY_RUN" -eq 1 && "$item" =~ ^[0-9]+$ ]]; then
-                TARGET_PORTS+=("socks5h://127.0.0.1:${item}")
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                norm_item=$(normalize_proxy_auth "$item")
+                if [[ "$norm_item" =~ ^(socks5h?|socks4a?|https?):// ]]; then
+                    TARGET_PORTS+=("$norm_item")
+                elif [[ "$norm_item" =~ ^[0-9]+$ ]]; then
+                    if (( 10#$norm_item < 1 || 10#$norm_item > 65535 )); then
+                        echo -e "${C_RED}[错误] 端口号必须在 1-65535 之间: $norm_item${C_RESET}" >&2
+                        exit 1
+                    fi
+                    TARGET_PORTS+=("socks5h://127.0.0.1:${norm_item}")
+                else
+                    TARGET_PORTS+=("socks5h://${norm_item}")
+                fi
             else
                 resolved=$(resolve_port_to_proxy "$item")
                 rc=$?
