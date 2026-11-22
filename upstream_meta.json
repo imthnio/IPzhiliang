@@ -3,6 +3,6 @@
   "script_version": "v2026-11-07",
   "upstream_commit": "8643bcd0a0b7b42ed53030f794d63ce72067ca77",
   "getopts_spec": "i:l:o:x:fhjnpyEM46",
-  "dnsbl_entries": 0,
-  "last_checked_utc": "2026-11-22T15:06:00Z"
+  "dnsbl_entries": 424,
+  "last_checked_utc": "2026-11-22T15:07:48Z"
 }
