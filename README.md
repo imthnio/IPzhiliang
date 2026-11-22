@@ -6,18 +6,13 @@
 > 上游同步状态：核心引擎 `v2026-11-07` · 上游提交 `8643bcd` · 黑名单数据库 `424` 条 · 最近自动同步 `2026-11-22T15:07:48Z`
 <!-- UPSTREAM_STATUS_END -->
 
-## 一键运行
+## 一键运行（全系统通用）
 
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh)
+```sh
+(command -v curl >/dev/null && curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/run.sh || wget -qO- https://raw.githubusercontent.com/imthnio/IPzhiliang/main/run.sh) | sh
 ```
 
-> 也兼容管道方式运行：`curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh | bash`
->
-> **Alpine Linux（默认无 `bash`/`curl`）一键运行**：
-> ```sh
-> apk add --no-cache bash curl && bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh)
-> ```
+> 自动识别 Alpine / Debian / Ubuntu / CentOS / Rocky / Arch / macOS，无 `curl` 或无 `bash` 时会自动通过 `wget` 拉取并自动补齐依赖，全程免手动操作。
 
 ## 核心功能
 
