@@ -7,7 +7,7 @@
 
 set -u
 
-VERSION="2.1.2"
+VERSION="2.2.0"
 SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
 
 # 颜色定义
@@ -29,6 +29,7 @@ BG_GREEN="\033[42m"
 BG_YELLOW="\033[43m"
 BG_RED="\033[41m"
 BG_BLUE="\033[44m"
+BG_PURPLE="\033[45m"
 
 UA_CHROME="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
@@ -42,7 +43,7 @@ LANG_CODE="cn"             # cn | en
 OUTPUT_FILE=""             # 导出文件路径 (.txt / .ansi / .json)
 JSON_MODE=0                # -j 纯 JSON 输出
 DEP_MODE="auto"            # auto(-y) | skip(-n)
-SKIP_MAIL=0                # --no-mail 跳过 25 端口检测
+MAIL_MODE="skip_default"   # skip_default(默认防云商25端口风控断连) | enable(--mail) | skip_user(--no-mail)
 SKIP_MEDIA=0               # --no-media 跳过流媒体与 AI 检测
 DRY_RUN=0                  # 仅展示配置不执行
 NON_INTERACTIVE=0          # CLI 直通模式
@@ -172,9 +173,10 @@ make_temp_dir() {
     echo "$d"
 }
 
-# 根据容器 cgroup pids.max 自动计算安全并发度（防止在 pids.max=64/128 的 LXD/LXC/NAT 小鸡上触发 fork 失败）
+# 根据容器 cgroup pids.max 与内存限额自动计算安全并发度（兼容低配 LXD/LXC/NAT 小鸡，杜绝 fork 失败与 OOM 断连）
 detect_max_jobs() {
-    local pmax="" pcur=0 avail=0
+    local pid_cap=6 mem_cap=6
+    local pmax="" pcur=0 avail_pids=0
     if [[ -r /sys/fs/cgroup/pids.max ]]; then
         pmax=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || true)
         pcur=$(cat /sys/fs/cgroup/pids.current 2>/dev/null || echo 0)
@@ -184,45 +186,99 @@ detect_max_jobs() {
     fi
 
     if [[ "$pmax" =~ ^[0-9]+$ && "$pcur" =~ ^[0-9]+$ ]]; then
-        avail=$(( pmax - pcur ))
-        if (( avail <= 35 )); then
-            echo 2
-        elif (( avail <= 90 )); then
-            echo 3
-        elif (( avail <= 160 )); then
-            echo 4
+        avail_pids=$(( pmax - pcur ))
+        if (( avail_pids <= 18 )); then
+            pid_cap=1
+        elif (( avail_pids <= 40 )); then
+            pid_cap=2
+        elif (( avail_pids <= 90 )); then
+            pid_cap=3
+        elif (( avail_pids <= 160 )); then
+            pid_cap=4
         else
-            echo 6
+            pid_cap=6
         fi
     else
-        echo 5
+        pid_cap=5
+    fi
+
+    local mmax="" mcur=0 limit_mb=0 avail_mb=0
+    if [[ -r /sys/fs/cgroup/memory.max ]]; then
+        mmax=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)
+        mcur=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0)
+    elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+        mmax=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true)
+        mcur=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo 0)
+    fi
+
+    if [[ "$mmax" =~ ^[0-9]+$ && ${#mmax} -le 13 ]]; then
+        limit_mb=$(( mmax / 1048576 ))
+        [[ "$mcur" =~ ^[0-9]+$ ]] && avail_mb=$(( (mmax - mcur) / 1048576 )) || avail_mb=$limit_mb
+        if (( limit_mb > 0 )); then
+            if (( avail_mb <= 64 || limit_mb <= 128 )); then
+                mem_cap=1
+            elif (( avail_mb <= 160 || limit_mb <= 280 )); then
+                mem_cap=2
+            elif (( avail_mb <= 320 || limit_mb <= 512 )); then
+                mem_cap=3
+            elif (( avail_mb <= 640 )); then
+                mem_cap=4
+            fi
+        fi
+    elif [[ -r /proc/meminfo ]]; then
+        local kb
+        kb=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)
+        [[ -z "$kb" ]] && kb=$(awk '/^MemFree:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)
+        if [[ "$kb" =~ ^[0-9]+$ ]]; then
+            avail_mb=$(( kb / 1024 ))
+            if (( avail_mb <= 64 )); then
+                mem_cap=1
+            elif (( avail_mb <= 160 )); then
+                mem_cap=2
+            elif (( avail_mb <= 320 )); then
+                mem_cap=3
+            elif (( avail_mb <= 640 )); then
+                mem_cap=4
+            fi
+        fi
+    fi
+
+    if (( pid_cap < mem_cap )); then
+        echo "$pid_cap"
+    else
+        echo "$mem_cap"
     fi
 }
 
-# 跨平台超时执行（兼容 BusyBox / GNU timeout -k 强杀与无 timeout 命令的 macOS）
+# 跨平台纯 Bash 单 PID 超时看门狗（绝不调用 BusyBox timeout，杜绝进程组信号误杀 SSH 会话与孤儿 sleep）
 run_with_timeout() {
     local secs="$1"
     shift
-    if command -v timeout >/dev/null 2>&1; then
-        timeout -k 1 "$secs" "$@"
-    elif command -v gtimeout >/dev/null 2>&1; then
-        gtimeout -k 1 "$secs" "$@"
-    else
-        "$@" &
-        local cmd_pid=$!
-        (
-            sleep "$secs"
-            kill -TERM "$cmd_pid" 2>/dev/null || true
-            sleep 1
-            kill -KILL "$cmd_pid" 2>/dev/null || true
-        ) &
-        local wd_pid=$!
-        wait "$cmd_pid" 2>/dev/null
-        local rc=$?
-        kill "$wd_pid" 2>/dev/null || true
-        wait "$wd_pid" 2>/dev/null || true
-        return "$rc"
-    fi
+    exec 3<&0
+    "$@" <&3 &
+    local cmd_pid=$!
+    exec 3<&-
+    (
+        sleep "$secs" &
+        local spid=$!
+        trap 'kill "$spid" 2>/dev/null || true; exit 0' TERM INT
+        wait "$spid" 2>/dev/null || true
+        kill -TERM "$cmd_pid" 2>/dev/null || true
+        sleep 1 &
+        spid=$!
+        wait "$spid" 2>/dev/null || true
+        kill -KILL "$cmd_pid" 2>/dev/null || true
+    ) </dev/null >/dev/null 2>&1 &
+    local wd_pid=$!
+    local rc=0
+    wait "$cmd_pid" 2>/dev/null || rc=$?
+    kill -TERM "$wd_pid" 2>/dev/null || true
+    wait "$wd_pid" 2>/dev/null || true
+    return "$rc"
+}
+
+curl_supports_parallel() {
+    (curl --help all 2>/dev/null || curl --help 2>/dev/null) | grep -q -- '--parallel'
 }
 
 strip_ansi() {
@@ -441,7 +497,8 @@ IPzhiliang v${VERSION} - 独立开源、隐私优先的 IP 质量与流媒体/AI
   -o <路径>          将报告保存到本地文件 (.txt / .ansi / .json，自动设为 0600 权限)
   -j                 在终端输出结构化 JSON 结果
   --no-media         跳过 AI 与流媒体解锁检测
-  --no-mail          跳过 25 端口邮局连通性检测
+  --mail             开启 25 端口邮局出站探测 (默认跳过，防止触发云商 25 端口风控断连)
+  --no-mail          显式跳过 25 端口邮局连通性检测
   -y                 自动安装缺失依赖 (curl / jq) [默认]
   -n                 跳过依赖自动安装
   --update           将本地 ipzhiliang.sh 更新到 GitHub 最新版本
@@ -1187,11 +1244,14 @@ step_advanced_options() {
 
     echo ""
     local mail_in=""
-    tty_read "5) 是否检测 25 端口邮局连通性? [Y/n] (当前: $([[ $SKIP_MAIL -eq 0 ]] && echo 开启 || echo 关闭)): " mail_in
-    if [[ "$mail_in" =~ ^[Nn]$ ]]; then
-        SKIP_MAIL=1
-    elif [[ "$mail_in" =~ ^[Yy]$ ]]; then
-        SKIP_MAIL=0
+    local mail_state_txt="默认跳过-防云商25端口风控"
+    [[ "$MAIL_MODE" == "enable" ]] && mail_state_txt="开启"
+    [[ "$MAIL_MODE" == "skip_user" ]] && mail_state_txt="已关闭"
+    tty_read "5) 是否主动探测 25 端口邮局出站? [y/N] (当前: ${mail_state_txt}): " mail_in
+    if [[ "$mail_in" =~ ^[Yy]$ ]]; then
+        MAIL_MODE="enable"
+    elif [[ "$mail_in" =~ ^[Nn]$ ]]; then
+        MAIL_MODE="skip_user"
     fi
     echo ""
 }
@@ -1230,7 +1290,11 @@ show_summary() {
     [[ -n "$OUTPUT_FILE" ]] && echo -e "  导出文件: ${OUTPUT_FILE} (0600 权限)"
     [[ "$JSON_MODE" -eq 1 ]] && echo -e "  JSON输出: 开启"
     [[ "$SKIP_MEDIA" -eq 1 ]] && echo -e "  流媒体/AI: 跳过"
-    [[ "$SKIP_MAIL" -eq 1 ]] && echo -e "  25端口检测: 跳过"
+    if [[ "$MAIL_MODE" == "enable" ]]; then
+        echo -e "  25端口检测: ${C_YELLOW}开启 (主动外连探测)${C_RESET}"
+    elif [[ "$MAIL_MODE" == "skip_user" ]]; then
+        echo -e "  25端口检测: 跳过"
+    fi
     if [[ -n "${ABUSEIPDB_API_KEY:-}" || -n "${IPQS_API_KEY:-}" ]]; then
         echo -e "  自有Key:  ${C_GREEN}已启用扩展风控库${C_RESET}"
     fi
@@ -1425,20 +1489,21 @@ probe_media_claude() {
 
 probe_media_gemini() {
     local stack="$1" out="$2"
-    local html status="failed" cc=""
-    html=$(curl_exec_stack "$stack" -fsL --compressed --connect-timeout 6 --max-time 12 \
+    local tmp_html="${out}.html" status="failed" cc=""
+    if curl_exec_stack "$stack" -fsL --compressed --max-filesize 4194304 --connect-timeout 6 --max-time 12 \
         -A "$UA_CHROME" \
         -H "Accept-Language: en-US,en;q=0.9" \
         -H "Cookie: SOCS=CAESHAgBEhIaAB" \
-        "https://gemini.google.com" 2>/dev/null || true)
-    if [[ -n "$html" ]]; then
-        cc=$(grep -oE '2,1,200,"[A-Z]{3}"' <<< "$html" 2>/dev/null | head -n1 | grep -oE '[A-Z]{3}' || true)
-        if grep -q '45631641' <<< "$html" 2>/dev/null; then
+        -o "$tmp_html" \
+        "https://gemini.google.com" 2>/dev/null && [[ -s "$tmp_html" ]]; then
+        cc=$(grep -oE '2,1,200,"[A-Z]{3}"' "$tmp_html" 2>/dev/null | head -n1 | grep -oE '[A-Z]{3}' || true)
+        if grep -q '45631641' "$tmp_html" 2>/dev/null; then
             status="yes"
         else
             status="blocked"
         fi
     fi
+    rm -f "$tmp_html" 2>/dev/null || true
     printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
 }
 
@@ -1494,19 +1559,19 @@ probe_media_disney() {
 
 probe_media_youtube() {
     local stack="$1" out="$2"
-    local html cc="" status="failed"
-    html=$(curl_exec_stack "$stack" -fsL --compressed --connect-timeout 6 --max-time 12 -A "$UA_CHROME" -H "Accept-Language: en" "https://www.youtube.com/premium" 2>/dev/null || true)
-    if [[ -n "$html" ]]; then
-        cc=$(grep -oE '"countryCode":"[A-Z]{2}"' <<< "$html" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-        if grep -qi "is not available in your country" <<< "$html" 2>/dev/null; then
+    local tmp_html="${out}.html" cc="" status="failed"
+    if curl_exec_stack "$stack" -fsL --compressed --max-filesize 4194304 --connect-timeout 6 --max-time 12 -A "$UA_CHROME" -H "Accept-Language: en" -o "$tmp_html" "https://www.youtube.com/premium" 2>/dev/null && [[ -s "$tmp_html" ]]; then
+        cc=$(grep -oE '"countryCode":"[A-Z]{2}"' "$tmp_html" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+        if grep -qi "is not available in your country" "$tmp_html" 2>/dev/null; then
             status="no_prem"
-        elif [[ -n "$cc" ]] || grep -qi "YouTube Premium" <<< "$html" 2>/dev/null; then
+        elif [[ -n "$cc" ]] || grep -qi "YouTube Premium" "$tmp_html" 2>/dev/null; then
             status="yes"
             [[ -z "$cc" ]] && cc="US"
         else
             status="blocked"
         fi
     fi
+    rm -f "$tmp_html" 2>/dev/null || true
     printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
 }
 
@@ -1516,16 +1581,16 @@ probe_media_tiktok() {
         printf 'no_ipv6|N/A\n' > "$out"
         return 0
     fi
-    local html cc="" status="failed"
-    html=$(curl_exec_stack "$stack" -fsL --compressed --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.tiktok.com/" 2>/dev/null || true)
-    if [[ -n "$html" ]]; then
-        cc=$(grep -oE '"region":"[A-Z]{2}"' <<< "$html" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+    local tmp_html="${out}.html" cc="" status="failed"
+    if curl_exec_stack "$stack" -fsL --compressed --max-filesize 4194304 --connect-timeout 6 --max-time 12 -A "$UA_CHROME" -o "$tmp_html" "https://www.tiktok.com/" 2>/dev/null && [[ -s "$tmp_html" ]]; then
+        cc=$(grep -oE '"region":"[A-Z]{2}"' "$tmp_html" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
         if [[ -n "$cc" ]]; then
             status="yes"
         else
             status="blocked"
         fi
     fi
+    rm -f "$tmp_html" 2>/dev/null || true
     printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
 }
 
@@ -1535,10 +1600,9 @@ probe_media_prime() {
         printf 'no_ipv6|N/A\n' > "$out"
         return 0
     fi
-    local html cc="" status="failed"
-    html=$(curl_exec_stack "$stack" -fsL --compressed --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.primevideo.com/" 2>/dev/null || true)
-    if [[ -n "$html" ]]; then
-        cc=$(grep -oE '"currentTerritory":"[A-Z]{2}"' <<< "$html" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+    local tmp_html="${out}.html" cc="" status="failed"
+    if curl_exec_stack "$stack" -fsL --compressed --max-filesize 4194304 --connect-timeout 6 --max-time 12 -A "$UA_CHROME" -o "$tmp_html" "https://www.primevideo.com/" 2>/dev/null && [[ -s "$tmp_html" ]]; then
+        cc=$(grep -oE '"currentTerritory":"[A-Z]{2}"' "$tmp_html" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
         if [[ "$cc" == "CN" ]]; then
             status="blocked"
         elif [[ -n "$cc" ]]; then
@@ -1547,6 +1611,7 @@ probe_media_prime() {
             status="blocked"
         fi
     fi
+    rm -f "$tmp_html" 2>/dev/null || true
     printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
 }
 
@@ -1610,7 +1675,31 @@ load_dnsbl_list() {
     fi
 }
 
-# 分批限流并发 DNSBL 扫描（适配低 pids.max LXC/NAT 小鸡；代理模式下强制走 DoH 防本机 DNS 泄露）
+is_dnsbl_hit() {
+    local z="$1" ans="$2"
+    if [[ -n "$ans" && "$ans" =~ ^127\. && "$ans" != 127.255.255.* && "$ans" != "127.0.1.255" ]]; then
+        case "$z" in
+            hostkarma.junkemailfilter.com)
+                # 127.0.0.1 为白名单，仅 127.0.0.2 为黑名单
+                [[ "$ans" == "127.0.0.2" ]] && return 0
+                return 1
+                ;;
+            bl.mailspike.net)
+                # 127.0.0.15-20 为中立/优质信誉，仅 127.0.0.2 / 10 / 11 / 12 为黑名单
+                case "$ans" in
+                    127.0.0.2|127.0.0.10|127.0.0.11|127.0.0.12) return 0 ;;
+                    *) return 1 ;;
+                esac
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    fi
+    return 1
+}
+
+# 单进程 HTTP/2 并行 (curl -Z) 或分批限流并发 DNSBL 扫描（极低内存/单 PID 兼容小鸡容器；代理模式下强制走 DoH 防本机 DNS 泄露）
 scan_dnsbl() {
     local ip="$1"
     local out_summary="$2"
@@ -1642,76 +1731,123 @@ scan_dnsbl() {
 
     local max_jobs
     max_jobs=$(detect_max_jobs)
-    local idx=0 batch_cnt=0
-    for z in "${zones[@]}"; do
-        idx=$((idx + 1))
-        batch_cnt=$((batch_cnt + 1))
-        (
-            local ans="" raw_doh=""
-            if [[ $use_doh -eq 1 ]]; then
-                # 直接用正则提取 Answer 中的 127.x.x.x，避免在每个并发子进程中额外 fork jq 进程
-                raw_doh=$(curl_exec -fsL --connect-timeout 3 --max-time 5 \
-                    -H "Accept: application/dns-json" \
-                    "https://dns.google/resolve?name=${rev_ip}.${z}&type=A" 2>/dev/null || true)
-                ans=$(grep -oE '"data":"127\.[0-9]+\.[0-9]+\.[0-9]+"' <<< "$raw_doh" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-            else
-                ans=$(dig +short +time=2 +tries=1 "${rev_ip}.${z}" A 2>/dev/null | head -n1 || true)
-            fi
-
-            local is_hit=0
-            if [[ -n "$ans" && "$ans" =~ ^127\. && "$ans" != 127.255.255.* && "$ans" != "127.0.1.255" ]]; then
-                case "$z" in
-                    hostkarma.junkemailfilter.com)
-                        # 127.0.0.1 为白名单，仅 127.0.0.2 为黑名单
-                        [[ "$ans" == "127.0.0.2" ]] && is_hit=1
-                        ;;
-                    bl.mailspike.net)
-                        # 127.0.0.15-20 为中立/优质信誉，仅 127.0.0.2 / 10 / 11 / 12 为黑名单
-                        case "$ans" in
-                            127.0.0.2|127.0.0.10|127.0.0.11|127.0.0.12) is_hit=1 ;;
-                        esac
-                        ;;
-                    *)
-                        is_hit=1
-                        ;;
-                esac
-            fi
-
-            if [[ $is_hit -eq 1 ]]; then
-                echo "HIT|${z}|${ans}" > "${dnsbl_dir}/${idx}.res"
-            else
-                echo "CLEAN" > "${dnsbl_dir}/${idx}.res"
-            fi
-        ) &
-
-        if (( batch_cnt >= max_jobs )); then
-            wait
-            batch_cnt=0
-        fi
-    done
-    wait
-
     local total=0 clean=0 hits=0
     : > "$out_hits"
-    local f line
-    for f in "${dnsbl_dir}"/*.res; do
-        [[ -f "$f" ]] || continue
-        total=$((total + 1))
-        line=$(cat "$f")
-        if [[ "$line" == HIT\|* ]]; then
-            hits=$((hits + 1))
-            echo "${line#HIT|}" >> "$out_hits"
-        else
-            clean=$((clean + 1))
+
+    if [[ $use_doh -eq 1 ]] && curl_supports_parallel; then
+        # 单进程 curl -Z 多路复用 DoH 查询：仅占 1 个 PID 与 ~6MB 内存，彻底避免容器 fork 耗尽或 OOM
+        # 注意：curl config 的 next 会重置 proxy/interface，因此必须在每个块内重复写入代理/网卡配置，杜绝直连泄露
+        local doh_cfg="${dnsbl_dir}/doh.cfg"
+        local old_umask
+        old_umask=$(umask)
+        umask 077
+        : > "$doh_cfg"
+        chmod 600 "$doh_cfg" 2>/dev/null || true
+        umask "$old_umask"
+
+        local proxy_cfg_line=""
+        if [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]]; then
+            proxy_cfg_line=$(cat "$ACTIVE_CURL_CFG")
         fi
-    done
+
+        local idx=0
+        for z in "${zones[@]}"; do
+            idx=$((idx + 1))
+            (( idx > 1 )) && printf 'next\n' >> "$doh_cfg"
+            {
+                printf 'silent\n'
+                printf 'location\n'
+                printf 'connect-timeout = 3\n'
+                printf 'max-time = 5\n'
+                printf 'header = "Accept: application/dns-json"\n'
+                if [[ -n "$proxy_cfg_line" ]]; then
+                    printf '%s\n' "$proxy_cfg_line"
+                elif [[ -n "$ACTIVE_IFACE" ]]; then
+                    printf 'interface = "%s"\n' "$ACTIVE_IFACE"
+                    if is_ipv6_literal "$ACTIVE_IFACE"; then
+                        printf 'ipv6\n'
+                    elif is_ipv4_literal "$ACTIVE_IFACE"; then
+                        printf 'ipv4\n'
+                    fi
+                fi
+                printf 'url = "https://dns.google/resolve?name=%s.%s&type=A"\n' "$rev_ip" "$z"
+                printf 'output = "%s/%d.json"\n' "$dnsbl_dir" "$idx"
+            } >> "$doh_cfg"
+        done
+
+        local pmax="$max_jobs"
+        (( pmax < 2 )) && pmax=2
+        (( pmax > 4 )) && pmax=4
+        curl -Z --parallel-max "$pmax" -K "$doh_cfg" 2>/dev/null || true
+        rm -f "$doh_cfg" 2>/dev/null || true
+
+        idx=0
+        local ans=""
+        for z in "${zones[@]}"; do
+            idx=$((idx + 1))
+            total=$((total + 1))
+            ans=""
+            if [[ -s "${dnsbl_dir}/${idx}.json" ]]; then
+                ans=$(grep -oE '"data":"127\.[0-9]+\.[0-9]+\.[0-9]+"' "${dnsbl_dir}/${idx}.json" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+            fi
+            if is_dnsbl_hit "$z" "$ans"; then
+                hits=$((hits + 1))
+                echo "${z}|${ans}" >> "$out_hits"
+            else
+                clean=$((clean + 1))
+            fi
+        done
+        rm -f "${dnsbl_dir}"/*.json 2>/dev/null || true
+    else
+        local idx=0 batch_cnt=0
+        for z in "${zones[@]}"; do
+            idx=$((idx + 1))
+            batch_cnt=$((batch_cnt + 1))
+            (
+                local ans="" raw_doh=""
+                if [[ $use_doh -eq 1 ]]; then
+                    raw_doh=$(curl_exec -fsL --connect-timeout 3 --max-time 5 \
+                        -H "Accept: application/dns-json" \
+                        "https://dns.google/resolve?name=${rev_ip}.${z}&type=A" 2>/dev/null || true)
+                    ans=$(grep -oE '"data":"127\.[0-9]+\.[0-9]+\.[0-9]+"' <<< "$raw_doh" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+                else
+                    ans=$(dig +short +time=2 +tries=1 "${rev_ip}.${z}" A 2>/dev/null | head -n1 || true)
+                fi
+
+                if is_dnsbl_hit "$z" "$ans"; then
+                    echo "HIT|${z}|${ans}" > "${dnsbl_dir}/${idx}.res"
+                else
+                    echo "CLEAN" > "${dnsbl_dir}/${idx}.res"
+                fi
+            ) &
+
+            if (( batch_cnt >= max_jobs )); then
+                wait
+                batch_cnt=0
+            fi
+        done
+        wait
+
+        local f line
+        for f in "${dnsbl_dir}"/*.res; do
+            [[ -f "$f" ]] || continue
+            total=$((total + 1))
+            line=$(cat "$f")
+            if [[ "$line" == HIT\|* ]]; then
+                hits=$((hits + 1))
+                echo "${line#HIT|}" >> "$out_hits"
+            else
+                clean=$((clean + 1))
+            fi
+        done
+    fi
 
     local mode_tag="dig"
     [[ $use_doh -eq 1 ]] && mode_tag="DoH"
     printf '%d|%d|%d|%s\n' "$total" "$clean" "$hits" "$mode_tag" > "$out_summary"
 }
 
-# 直接探测单个 SMTP 25 端口（绝不使用 sh -c 管道，避免 BusyBox timeout 产生孤儿 nc 进程挂死）
+# 直接探测单个 SMTP 25 端口（纯 Bash 单 PID 超时看门狗，绝不使用 BusyBox timeout 或 sh -c 管道）
 probe_smtp_host() {
     local host="$1"
     local bind_ip="${2:-}"
@@ -1724,7 +1860,7 @@ probe_smtp_host() {
     [[ "$resp" == *"220"* ]]
 }
 
-# 邮局 25 端口连通性检测（代理模式下严格跳过直连，防止绕过代理泄露本机 IP）
+# 邮局 25 端口连通性检测（默认跳过主动外连以防触发云商/LXD/NAT 反垃圾邮件 25 端口风控断连；加 --mail 可主动开启）
 scan_mail_port25() {
     local ip="$1"
     local out_file="$2"
@@ -1733,7 +1869,7 @@ scan_mail_port25() {
         printf 'proxy_skip|0||\n' > "$out_file"
         return 0
     fi
-    if [[ "$SKIP_MAIL" -eq 1 ]]; then
+    if [[ "$MAIL_MODE" == "skip_user" ]]; then
         printf 'user_skip|0||\n' > "$out_file"
         return 0
     fi
@@ -1743,6 +1879,15 @@ scan_mail_port25() {
         local_status="occupied"
     elif command -v netstat >/dev/null 2>&1 && netstat -tln 2>/dev/null | grep -qE '[:.]25([[:space:]]|$)'; then
         local_status="occupied"
+    fi
+
+    if [[ "$MAIL_MODE" != "enable" ]]; then
+        if [[ "$local_status" == "occupied" ]]; then
+            printf 'occupied|0||\n' > "$out_file"
+        else
+            printf 'default_skip|0||\n' > "$out_file"
+        fi
+        return 0
     fi
 
     if ! command -v nc >/dev/null 2>&1; then
@@ -1823,50 +1968,59 @@ scan_mail_port25() {
 # 渲染辅助函数（经典 72 列视觉风格：三色渐变评分条、色块标签、横向解锁矩阵）
 # ==============================================================================
 
-# 经典 48 列三色渐变风险条（绿 0-33% -> 黄 33-66% -> 红 66-100%，右侧定宽对齐风险等级）
+# 经典 42 列三色渐变风险条（绿 0-33% -> 黄 33-66% -> 红 66-100%，右侧定宽垂直对齐分值与风险等级，总宽精准 72 列）
 render_risk_bar() {
     local score="$1"
     (( score < 0 )) && score=0
     (( score > 100 )) && score=100
 
-    local risk_label=""
+    local risk_color="$C_GREEN" risk_text=""
     if (( score < 20 )); then
-        [[ "$LANG_CODE" == "en" ]] && risk_label="${C_GREEN}${C_BOLD}VeryLow${C_RESET}" || risk_label="${C_GREEN}${C_BOLD}极低风险${C_RESET}"
+        risk_color="$C_GREEN"
+        [[ "$LANG_CODE" == "en" ]] && risk_text="VeryLow" || risk_text="极低风险"
     elif (( score < 40 )); then
-        [[ "$LANG_CODE" == "en" ]] && risk_label="${C_GREEN}${C_BOLD}Low${C_RESET}" || risk_label="${C_GREEN}${C_BOLD}低风险${C_RESET}"
+        risk_color="$C_GREEN"
+        [[ "$LANG_CODE" == "en" ]] && risk_text="Low" || risk_text="低风险"
     elif (( score < 65 )); then
-        [[ "$LANG_CODE" == "en" ]] && risk_label="${C_YELLOW}${C_BOLD}Medium${C_RESET}" || risk_label="${C_YELLOW}${C_BOLD}中风险${C_RESET}"
+        risk_color="$C_YELLOW"
+        [[ "$LANG_CODE" == "en" ]] && risk_text="Medium" || risk_text="中风险"
     elif (( score < 85 )); then
-        [[ "$LANG_CODE" == "en" ]] && risk_label="${C_RED}${C_BOLD}High${C_RESET}" || risk_label="${C_RED}${C_BOLD}高风险${C_RESET}"
+        risk_color="$C_RED"
+        [[ "$LANG_CODE" == "en" ]] && risk_text="High" || risk_text="高风险"
     else
-        [[ "$LANG_CODE" == "en" ]] && risk_label="${C_RED}${C_BOLD}VeryHigh${C_RESET}" || risk_label="${C_RED}${C_BOLD}极高风险${C_RESET}"
+        risk_color="$C_RED"
+        [[ "$LANG_CODE" == "en" ]] && risk_text="VeryHigh" || risk_text="极高风险"
     fi
 
-    local text="${score}|"
-    local tlen=${#text}
-    local fill_len=$(( score * 48 / 100 ))
-    (( fill_len < tlen )) && fill_len=$tlen
-    (( fill_len > 48 )) && fill_len=48
+    local bar_w=42
+    local fill_len=1
+    if (( score > 0 )); then
+        fill_len=$(( (score * bar_w + 50) / 100 ))
+        (( fill_len < 1 )) && fill_len=1
+        (( fill_len > bar_w )) && fill_len=$bar_w
+    fi
 
-    local left_pad=$(( fill_len - tlen ))
-    local right_pad=$(( 48 - fill_len ))
+    local left_pad=$(( fill_len - 1 ))
+    local right_pad=$(( bar_w - fill_len ))
     local filled_str empty_str
-    filled_str="$(printf '%*s' "$left_pad" '')${text}"
+    filled_str="$(printf '%*s' "$left_pad" '')|"
     empty_str="$(printf '%*s' "$right_pad" '')"
 
-    local s1="${filled_str:0:16}"
-    local s2="${filled_str:16:16}"
-    local s3="${filled_str:32:16}"
+    local s1="${filled_str:0:14}"
+    local s2="${filled_str:14:14}"
+    local s3="${filled_str:28:14}"
 
     local out=""
     [[ -n "$s1" ]] && out+="${BG_GREEN}${C_WHITE}${C_BOLD}${s1}"
     [[ -n "$s2" ]] && out+="${BG_YELLOW}${C_WHITE}${C_BOLD}${s2}"
     [[ -n "$s3" ]] && out+="${BG_RED}${C_WHITE}${C_BOLD}${s3}"
-    out+="${C_RESET}${empty_str} ${risk_label}"
+    local score_fmt
+    printf -v score_fmt '%3d' "$score"
+    out+="${C_RESET}${empty_str}  ${risk_color}${C_BOLD}${score_fmt} ${risk_text}${C_RESET}"
     printf "%b" "$out"
 }
 
-# 12 列定宽色块类型标签（用于「二、IP类型属性」横向矩阵）
+# 12 列定宽色块类型标签（用于「二、IP类型属性」横向矩阵，未知/无统一使用紫色色块）
 render_type_cell() {
     local raw="$1"
     local low
@@ -1876,23 +2030,23 @@ render_type_cell() {
             isp|residential|"fixed line isp")
                 printf "   ${BG_GREEN}${C_WHITE}${C_BOLD} ISP ${C_RESET}    " ;;
             mobile|wireless)
-                printf " ${BG_GREEN}${C_WHITE}${C_BOLD} Mobile ${C_RESET}  " ;;
+                printf "  ${BG_GREEN}${C_WHITE}${C_BOLD} Mobile ${C_RESET}  " ;;
             business|commercial)
-                printf "${BG_YELLOW}${C_WHITE}${C_BOLD} Business ${C_RESET} " ;;
+                printf " ${BG_YELLOW}${C_WHITE}${C_BOLD} Business ${C_RESET} " ;;
             hosting|datacenter)
-                printf " ${BG_RED}${C_WHITE}${C_BOLD} Hosting ${C_RESET} " ;;
+                printf " ${BG_RED}${C_WHITE}${C_BOLD} Hosting ${C_RESET}  " ;;
             vpn)
                 printf "   ${BG_RED}${C_WHITE}${C_BOLD} VPN ${C_RESET}    " ;;
             socks*|proxy|compromised)
-                printf "  ${BG_RED}${C_WHITE}${C_BOLD} Proxy ${C_RESET}  " ;;
+                printf "  ${BG_RED}${C_WHITE}${C_BOLD} Proxy ${C_RESET}   " ;;
             education)
-                printf "${BG_YELLOW}${C_WHITE}${C_BOLD} Education ${C_RESET}" ;;
+                printf "${BG_YELLOW}${C_WHITE}${C_BOLD} Education ${C_RESET} " ;;
             government)
-                printf "${BG_YELLOW}${C_WHITE}${C_BOLD}   Gov.    ${C_RESET}" ;;
+                printf "   ${BG_YELLOW}${C_WHITE}${C_BOLD} Gov. ${C_RESET}   " ;;
             ""|null|unknown)
-                printf "   ${C_DIM}  -  ${C_RESET}    " ;;
+                printf "   ${BG_PURPLE}${C_WHITE}${C_BOLD} N/A ${C_RESET}    " ;;
             *)
-                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} Other ${C_RESET}  " ;;
+                printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} Other ${C_RESET}   " ;;
         esac
     else
         case "$low" in
@@ -1913,7 +2067,7 @@ render_type_cell() {
             government)
                 printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} 政府 ${C_RESET}    " ;;
             ""|null|unknown)
-                printf "    ${C_DIM}无${C_RESET}      " ;;
+                printf "  ${BG_PURPLE}${C_WHITE}${C_BOLD}  无  ${C_RESET}    " ;;
             *)
                 printf "  ${BG_YELLOW}${C_WHITE}${C_BOLD} 其他 ${C_RESET}    " ;;
         esac
@@ -1927,9 +2081,9 @@ render_factor_cc() {
         printf "  ${C_GREEN}[%s]${C_RESET}    " "$cc"
     else
         if [[ "$LANG_CODE" == "en" ]]; then
-            printf "   ${C_DIM}N/A${C_RESET}    "
+            printf "   ${C_PURPLE}N/A${C_RESET}    "
         else
-            printf "   ${C_GREEN}无${C_RESET}     "
+            printf "   ${C_PURPLE}无${C_RESET}     "
         fi
     fi
 }
@@ -1953,9 +2107,9 @@ render_factor_bool() {
             ;;
         *)
             if [[ "$LANG_CODE" == "en" ]]; then
-                printf "   ${C_GREEN}N/A${C_RESET}    "
+                printf "   ${C_PURPLE}N/A${C_RESET}    "
             else
-                printf "   ${C_GREEN}无${C_RESET}     "
+                printf "   ${C_PURPLE}无${C_RESET}     "
             fi
             ;;
     esac
@@ -1970,8 +2124,8 @@ render_media_badge_8() {
             originals) printf "${BG_YELLOW}${C_WHITE}${C_BOLD} Orig.  ${C_RESET}" ;;
             api_only)  printf "${BG_YELLOW}${C_WHITE}${C_BOLD} APIOnl ${C_RESET}" ;;
             no_prem)   printf "${BG_RED}${C_WHITE}${C_BOLD} NoPrem ${C_RESET}" ;;
-            blocked)   printf " ${BG_RED}${C_WHITE}${C_BOLD} Block${C_RESET} " ;;
-            no_ipv6)   printf " ${C_DIM}[NoV6]${C_RESET} " ;;
+            blocked)   printf "${BG_RED}${C_WHITE}${C_BOLD} Block  ${C_RESET}" ;;
+            no_ipv6)   printf " ${BG_PURPLE}${C_WHITE}${C_BOLD} NoV6 ${C_RESET} " ;;
             *)         printf " ${BG_RED}${C_WHITE}${C_BOLD} Fail ${C_RESET} " ;;
         esac
     else
@@ -1981,7 +2135,7 @@ render_media_badge_8() {
             api_only)  printf "${BG_YELLOW}${C_WHITE}${C_BOLD} 仅API  ${C_RESET}" ;;
             no_prem)   printf "${BG_RED}${C_WHITE}${C_BOLD} 禁会员 ${C_RESET}" ;;
             blocked)   printf " ${BG_RED}${C_WHITE}${C_BOLD} 屏蔽 ${C_RESET} " ;;
-            no_ipv6)   printf " ${C_DIM}[无V6]${C_RESET} " ;;
+            no_ipv6)   printf " ${BG_PURPLE}${C_WHITE}${C_BOLD} 无V6 ${C_RESET} " ;;
             *)         printf " ${BG_RED}${C_WHITE}${C_BOLD} 失败 ${C_RESET} " ;;
         esac
     fi
@@ -2052,38 +2206,64 @@ run_single_ip_check() {
     local run_dir="${TMP_WORKDIR}/run_${stack}_${RANDOM}"
     mkdir -p "$run_dir"
 
-    # ---------------- Phase 1: 分批并发查询 6 大独立 IP 情报库（控制峰值 PID 数，兼容小鸡容器） ----------------
+    local max_jobs batch_cnt=0
+    max_jobs=$(detect_max_jobs)
+
+    # ---------------- Phase 1: 按容器安全并发上限分批查询 6 大独立 IP 情报库 ----------------
     echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(1/3) 正在并发查询多源 IP 情报与风控数据库...${C_RESET}" >&2
-    fetch_db_json "https://ipinfo.io/widget/demo/${ip}" "$stack" "${run_dir}/db_ipinfo.json" &
-    fetch_db_json "https://api.ipquery.io/${ip}" "$stack" "${run_dir}/db_ipquery.json" &
-    fetch_db_json "https://proxycheck.io/v2/${ip}?vpn=1&asn=1&risk=1" "$stack" "${run_dir}/db_proxycheck.json" &
-    fetch_scamalytics_data "$ip" "${run_dir}/db_scam.json" &
-    wait
-    fetch_db_json "http://ip-api.com/json/${ip}?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,mobile,proxy,hosting" "$stack" "${run_dir}/db_ipapi.json" &
-    fetch_db_json "https://api.ip2location.io/?ip=${ip}" "$stack" "${run_dir}/db_ip2loc.json" &
-    fetch_optional_byok "$ip" "$run_dir" &
+    local p1_task
+    for p1_task in ipinfo ipquery proxycheck scam ipapi ip2loc byok; do
+        case "$p1_task" in
+            ipinfo)     fetch_db_json "https://ipinfo.io/widget/demo/${ip}" "$stack" "${run_dir}/db_ipinfo.json" & ;;
+            ipquery)    fetch_db_json "https://api.ipquery.io/${ip}" "$stack" "${run_dir}/db_ipquery.json" & ;;
+            proxycheck) fetch_db_json "https://proxycheck.io/v2/${ip}?vpn=1&asn=1&risk=1" "$stack" "${run_dir}/db_proxycheck.json" & ;;
+            scam)       fetch_scamalytics_data "$ip" "${run_dir}/db_scam.json" & ;;
+            ipapi)      fetch_db_json "http://ip-api.com/json/${ip}?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,mobile,proxy,hosting" "$stack" "${run_dir}/db_ipapi.json" & ;;
+            ip2loc)     fetch_db_json "https://api.ip2location.io/?ip=${ip}" "$stack" "${run_dir}/db_ip2loc.json" & ;;
+            byok)       fetch_optional_byok "$ip" "$run_dir" & ;;
+        esac
+        batch_cnt=$((batch_cnt + 1))
+        if (( batch_cnt >= max_jobs )); then
+            wait
+            batch_cnt=0
+        fi
+    done
     wait
     echo -ne "\r\033[2K" >&2
 
-    # ---------------- Phase 2: 分批并发检测 9 大 AI 与流媒体平台 ----------------
+    # ---------------- Phase 2: 按容器安全并发上限分批检测 9 大 AI 与流媒体平台 ----------------
     if [[ "$SKIP_MEDIA" -eq 0 ]]; then
         echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(2/3) 正在并发检测 AI (ChatGPT/Claude/Gemini) 与流媒体解锁...${C_RESET}" >&2
-        probe_media_chatgpt "$stack" "${run_dir}/m_chatgpt.txt" &
-        probe_media_claude "$stack" "${run_dir}/m_claude.txt" &
-        probe_media_gemini "$stack" "${run_dir}/m_gemini.txt" &
-        probe_media_netflix "$stack" "${run_dir}/m_netflix.txt" &
-        wait
-        probe_media_disney "$stack" "${run_dir}/m_disney.txt" &
-        probe_media_youtube "$stack" "${run_dir}/m_youtube.txt" &
-        probe_media_tiktok "$stack" "${run_dir}/m_tiktok.txt" &
-        probe_media_prime "$stack" "${run_dir}/m_prime.txt" &
-        probe_media_reddit "$stack" "${run_dir}/m_reddit.txt" &
+        batch_cnt=0
+        local p2_task
+        for p2_task in chatgpt claude gemini netflix disney youtube tiktok prime reddit; do
+            case "$p2_task" in
+                chatgpt) probe_media_chatgpt "$stack" "${run_dir}/m_chatgpt.txt" & ;;
+                claude)  probe_media_claude "$stack" "${run_dir}/m_claude.txt" & ;;
+                gemini)  probe_media_gemini "$stack" "${run_dir}/m_gemini.txt" & ;;
+                netflix) probe_media_netflix "$stack" "${run_dir}/m_netflix.txt" & ;;
+                disney)  probe_media_disney "$stack" "${run_dir}/m_disney.txt" & ;;
+                youtube) probe_media_youtube "$stack" "${run_dir}/m_youtube.txt" & ;;
+                tiktok)  probe_media_tiktok "$stack" "${run_dir}/m_tiktok.txt" & ;;
+                prime)   probe_media_prime "$stack" "${run_dir}/m_prime.txt" & ;;
+                reddit)  probe_media_reddit "$stack" "${run_dir}/m_reddit.txt" & ;;
+            esac
+            batch_cnt=$((batch_cnt + 1))
+            if (( batch_cnt >= max_jobs )); then
+                wait
+                batch_cnt=0
+            fi
+        done
         wait
         echo -ne "\r\033[2K" >&2
     fi
 
-    # ---------------- Phase 3: 顺序执行 DNSBL 限流并发扫描与 25 端口检测（彻底杜绝低 pids.max 容器 fork 失败） ----------------
-    echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(3/3) 正在扫描 DNSBL 黑名单与邮局 25 端口...${C_RESET}" >&2
+    # ---------------- Phase 3: 单进程 DoH / 限流 DNSBL 扫描与可选 25 端口检测 ----------------
+    if [[ "$MAIL_MODE" == "enable" ]]; then
+        echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(3/3) 正在扫描 DNSBL 黑名单与邮局 25 端口...${C_RESET}" >&2
+    else
+        echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(3/3) 正在扫描 DNSBL 黑名单...${C_RESET}" >&2
+    fi
     if [[ "$stack" == "4" ]]; then
         scan_dnsbl "$ip" "${run_dir}/dnsbl_summary.txt" "${run_dir}/dnsbl_hits.txt"
     fi
@@ -2436,20 +2616,20 @@ run_single_ip_check() {
         # 二、IP类型属性
         if [[ "$LANG_CODE" == "en" ]]; then
             echo -e "2. IP Type"
-            echo -e "${C_CYAN}Database:   ${C_RESET}${C_ITALIC}  IPinfo     ProxyCheck   IPQuery     IP-API  ${C_RESET}"
+            echo -e "${C_CYAN}Database:   ${C_RESET}${C_ITALIC}  IPinfo    ProxyCheck    IPQuery     IP-API  ${C_RESET}"
             printf "${C_CYAN}Usage:      ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_use")" "$(render_type_cell "$t_pcheck")" "$(render_type_cell "$t_ipquery_use")" "$(render_type_cell "$t_ipapi_use")"
             printf "${C_CYAN}Company:    ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_com")" "$(render_type_cell "")" "$(render_type_cell "")" "$(render_type_cell "")"
         else
             echo -e "二、IP类型属性"
-            echo -e "${C_CYAN}数据库：    ${C_RESET}${C_ITALIC}  IPinfo     ProxyCheck   IPQuery     IP-API  ${C_RESET}"
+            echo -e "${C_CYAN}数据库：    ${C_RESET}${C_ITALIC}  IPinfo    ProxyCheck    IPQuery     IP-API  ${C_RESET}"
             printf "${C_CYAN}使用类型：  ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_use")" "$(render_type_cell "$t_pcheck")" "$(render_type_cell "$t_ipquery_use")" "$(render_type_cell "$t_ipapi_use")"
             printf "${C_CYAN}公司类型：  ${C_RESET}%b%b%b%b\n" "$(render_type_cell "$t_ipinfo_com")" "$(render_type_cell "")" "$(render_type_cell "")" "$(render_type_cell "")"
         fi
 
-        # 三、风险评分（经典三色渐变热力条）
+        # 三、风险评分（经典三色渐变热力条 + 右侧垂直对齐分值与风险等级）
         if [[ "$LANG_CODE" == "en" ]]; then
             echo -e "3. Risk Score"
-            echo -e "${C_CYAN}Levels:         ${C_ITALIC}${C_WHITE}${BG_GREEN}VeryLow     Low ${BG_YELLOW}     Medium     ${BG_RED} High   VeryHigh${C_RESET}"
+            echo -e "${C_CYAN}Levels:         ${C_WHITE}${C_BOLD}${BG_GREEN} VeryLow  Low ${BG_YELLOW}    Medium    ${BG_RED} High VeryHigh${C_RESET}"
             [[ "$s_scam" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}Scamalytics:    ${C_RESET}%b\n" "$(render_risk_bar "$s_scam")"
             [[ "$s_pcheck" =~ ^[0-9]+$ ]]  && printf "${C_CYAN}ProxyCheck:     ${C_RESET}%b\n" "$(render_risk_bar "$s_pcheck")"
             [[ "$s_ipquery" =~ ^[0-9]+$ ]] && printf "${C_CYAN}IPQuery:        ${C_RESET}%b\n" "$(render_risk_bar "$s_ipquery")"
@@ -2458,7 +2638,7 @@ run_single_ip_check() {
             printf "${C_CYAN}${C_BOLD}Composite:      ${C_RESET}%b\n" "$(render_risk_bar "$avg_score")"
         else
             echo -e "三、风险评分"
-            echo -e "${C_CYAN}风险等级：      ${C_ITALIC}${C_WHITE}${BG_GREEN}极低         低 ${BG_YELLOW}      中等      ${BG_RED} 高         极高${C_RESET}"
+            echo -e "${C_CYAN}风险等级：      ${C_WHITE}${C_BOLD}${BG_GREEN} 极低      低 ${BG_YELLOW}     中等     ${BG_RED} 高      极高 ${C_RESET}"
             [[ "$s_scam" =~ ^[0-9]+$ ]]    && printf "${C_CYAN}Scamalytics：   ${C_RESET}%b\n" "$(render_risk_bar "$s_scam")"
             [[ "$s_pcheck" =~ ^[0-9]+$ ]]  && printf "${C_CYAN}ProxyCheck：    ${C_RESET}%b\n" "$(render_risk_bar "$s_pcheck")"
             [[ "$s_ipquery" =~ ^[0-9]+$ ]] && printf "${C_CYAN}IPQuery：       ${C_RESET}%b\n" "$(render_risk_bar "$s_ipquery")"
@@ -2523,12 +2703,13 @@ run_single_ip_check() {
         if [[ "$LANG_CODE" == "en" ]]; then
             echo -e "6. Email Service Availability and Blacklist Detection"
             case "$mail_local" in
-                available)  echo -e "${C_CYAN}Local Port 25 Outbound: ${C_GREEN}Available${C_RESET}" ;;
-                occupied)   echo -e "${C_CYAN}Local Port 25 Outbound: ${C_YELLOW}Occupied${C_RESET}" ;;
-                proxy_skip) echo -e "${C_CYAN}Local Port 25 Outbound: ${C_DIM}Skipped in proxy mode (prevents direct IP leak)${C_RESET}" ;;
-                user_skip)  echo -e "${C_CYAN}Local Port 25 Outbound: ${C_DIM}Skipped (--no-mail)${C_RESET}" ;;
-                no_nc)      echo -e "${C_CYAN}Local Port 25 Outbound: ${C_DIM}Skipped (nc not installed)${C_RESET}" ;;
-                *)          echo -e "${C_CYAN}Local Port 25 Outbound: ${C_RED}Blocked${C_RESET}" ;;
+                available)    echo -e "${C_CYAN}Local Port 25 Outbound: ${C_GREEN}Available${C_RESET}" ;;
+                occupied)     echo -e "${C_CYAN}Local Port 25 Outbound: ${C_YELLOW}Occupied${C_RESET}" ;;
+                proxy_skip)   echo -e "${C_CYAN}Local Port 25 Outbound: ${C_DIM}Skipped in proxy mode (prevents direct IP leak)${C_RESET}" ;;
+                default_skip) echo -e "${C_CYAN}Local Port 25 Outbound: ${C_DIM}Skipped by default (use --mail to probe)${C_RESET}" ;;
+                user_skip)    echo -e "${C_CYAN}Local Port 25 Outbound: ${C_DIM}Skipped (--no-mail)${C_RESET}" ;;
+                no_nc)        echo -e "${C_CYAN}Local Port 25 Outbound: ${C_DIM}Skipped (nc not installed)${C_RESET}" ;;
+                *)            echo -e "${C_CYAN}Local Port 25 Outbound: ${C_RED}Blocked${C_RESET}" ;;
             esac
             if [[ -n "$mail_badges" ]]; then
                 echo -e "${C_CYAN}Conn: ${C_RESET}${mail_badges}"
@@ -2544,12 +2725,13 @@ run_single_ip_check() {
         else
             echo -e "六、邮局连通性及黑名单检测"
             case "$mail_local" in
-                available)  echo -e "${C_CYAN}本地25端口出站：${C_GREEN}可用${C_RESET}" ;;
-                occupied)   echo -e "${C_CYAN}本地25端口出站：${C_YELLOW}占用${C_RESET}" ;;
-                proxy_skip) echo -e "${C_CYAN}本地25端口出站：${C_DIM}代理模式已跳过（防止直连泄露宿主机IP）${C_RESET}" ;;
-                user_skip)  echo -e "${C_CYAN}本地25端口出站：${C_DIM}已跳过 (--no-mail)${C_RESET}" ;;
-                no_nc)      echo -e "${C_CYAN}本地25端口出站：${C_DIM}未安装 nc 已跳过${C_RESET}" ;;
-                *)          echo -e "${C_CYAN}本地25端口出站：${C_RED}阻断${C_RESET}" ;;
+                available)    echo -e "${C_CYAN}本地25端口出站：${C_GREEN}可用${C_RESET}" ;;
+                occupied)     echo -e "${C_CYAN}本地25端口出站：${C_YELLOW}占用${C_RESET}" ;;
+                proxy_skip)   echo -e "${C_CYAN}本地25端口出站：${C_DIM}代理模式已跳过（防止直连泄露宿主机IP）${C_RESET}" ;;
+                default_skip) echo -e "${C_CYAN}本地25端口出站：${C_DIM}默认跳过（防云商25端口风控断连，加 --mail 开启）${C_RESET}" ;;
+                user_skip)    echo -e "${C_CYAN}本地25端口出站：${C_DIM}已跳过 (--no-mail)${C_RESET}" ;;
+                no_nc)        echo -e "${C_CYAN}本地25端口出站：${C_DIM}未安装 nc 已跳过${C_RESET}" ;;
+                *)            echo -e "${C_CYAN}本地25端口出站：${C_RED}阻断${C_RESET}" ;;
             esac
             if [[ -n "$mail_badges" ]]; then
                 echo -e "${C_CYAN}通信：${C_RESET}${mail_badges}"
@@ -2832,9 +3014,14 @@ parse_cli_args() {
                 SKIP_MEDIA=1
                 shift
                 ;;
+            --mail)
+                NON_INTERACTIVE=1
+                MAIL_MODE="enable"
+                shift
+                ;;
             --no-mail)
                 NON_INTERACTIVE=1
-                SKIP_MAIL=1
+                MAIL_MODE="skip_user"
                 shift
                 ;;
             -y)
