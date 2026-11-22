@@ -2,8 +2,8 @@ name: Sync Upstream IPQuality & Databases
 
 on:
   schedule:
-    # 每天 UTC 02:00（北京时间 10:00）自动检查上游检测引擎与数据库更新
-    - cron: '0 2 * * *'
+    # 每 6 小时自动检查上游检测引擎与全部数据库更新
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 permissions:
@@ -24,28 +24,34 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 获取上游最新 commit 与核心脚本/数据库文件
+          # 获取上游最新 commit 与核心脚本/全部数据库文件
           UP_COMMIT=$(curl -fsSL "https://api.github.com/repos/xykt/IPQuality/commits/main" | jq -r '.sha')
           curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh" -o /tmp/upstream_ip.sh
           curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/xykt/IPQuality/main/ref/dnsbl.list" -o /tmp/dnsbl.list || touch /tmp/dnsbl.list
+          curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/xykt/IPQuality/main/ref/iata-icao.csv" -o /tmp/iata-icao.csv || touch /tmp/iata-icao.csv
+          curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/xykt/IPQuality/main/ref/iso3166.json" -o /tmp/iso3166.json || touch /tmp/iso3166.json
+          curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/xykt/IPQuality/main/ref/cookies.txt" -o /tmp/cookies.txt || touch /tmp/cookies.txt
 
           SCRIPT_VER=$(grep -m1 '^script_version=' /tmp/upstream_ip.sh | cut -d'"' -f2)
           GETOPTS_SPEC=$(grep -m1 'while getopts' /tmp/upstream_ip.sh | sed -E 's/.*getopts "([^"]+)".*/\1/' || true)
           DNSBL_COUNT=$(grep -cve '^[[:space:]]*$' /tmp/dnsbl.list || echo 0)
+          DB_HASH=$(cat /tmp/upstream_ip.sh /tmp/dnsbl.list /tmp/iata-icao.csv /tmp/iso3166.json /tmp/cookies.txt | sha256sum | awk '{print $1}')
           NOW_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           OLD_COMMIT=$(jq -r '.upstream_commit // ""' upstream_meta.json 2>/dev/null || echo "")
           OLD_VER=$(jq -r '.script_version // ""' upstream_meta.json 2>/dev/null || echo "")
           OLD_GETOPTS=$(jq -r '.getopts_spec // ""' upstream_meta.json 2>/dev/null || echo "")
           OLD_DNSBL=$(jq -r '.dnsbl_entries // 0' upstream_meta.json 2>/dev/null || echo 0)
+          OLD_DB_HASH=$(jq -r '.db_bundle_sha256 // ""' upstream_meta.json 2>/dev/null || echo "")
 
           echo "Upstream commit: ${UP_COMMIT}"
           echo "Upstream script_version: ${SCRIPT_VER}"
           echo "Upstream getopts: ${GETOPTS_SPEC}"
           echo "Upstream DNSBL entries: ${DNSBL_COUNT}"
+          echo "Upstream DB bundle sha256: ${DB_HASH}"
 
           CHANGED="false"
-          if [[ "$UP_COMMIT" != "$OLD_COMMIT" || "$SCRIPT_VER" != "$OLD_VER" || "$DNSBL_COUNT" != "$OLD_DNSBL" || "$GETOPTS_SPEC" != "$OLD_GETOPTS" ]]; then
+          if [[ "$UP_COMMIT" != "$OLD_COMMIT" || "$SCRIPT_VER" != "$OLD_VER" || "$DNSBL_COUNT" != "$OLD_DNSBL" || "$GETOPTS_SPEC" != "$OLD_GETOPTS" || "$DB_HASH" != "$OLD_DB_HASH" ]]; then
             CHANGED="true"
           fi
 
@@ -69,6 +75,7 @@ jobs:
               --arg commit "$UP_COMMIT" \
               --arg opts "$GETOPTS_SPEC" \
               --argjson dnsbl "$DNSBL_COUNT" \
+              --arg dbhash "$DB_HASH" \
               --arg now "$NOW_UTC" \
               '{
                 upstream_repo: $repo,
@@ -76,6 +83,7 @@ jobs:
                 upstream_commit: $commit,
                 getopts_spec: $opts,
                 dnsbl_entries: $dnsbl,
+                db_bundle_sha256: $dbhash,
                 last_checked_utc: $now
               }' > upstream_meta.json
 

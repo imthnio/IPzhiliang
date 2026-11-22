@@ -7,7 +7,7 @@
 
 set -u
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
 UPSTREAM_PRIMARY="https://IP.Check.Place"
 UPSTREAM_FALLBACK="https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh"
@@ -72,12 +72,57 @@ tty_read() {
     printf -v "$var_name" '%s' "$input"
 }
 
+# 自动识别当前操作系统与虚拟化环境（母鸡/小鸡）
+detect_host_env() {
+    local os_name="Unknown"
+    local virt_type="物理机(母鸡)"
+
+    if [[ -r /etc/os-release ]]; then
+        os_name=$(awk -F= '/^PRETTY_NAME=/ {gsub(/"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null)
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        os_name="macOS $(sw_vers -productVersion 2>/dev/null || true)"
+    else
+        os_name="$(uname -s) $(uname -r)"
+    fi
+
+    if [[ -f /.dockerenv ]] || grep -qaE 'docker|containerd' /proc/1/cgroup 2>/dev/null; then
+        virt_type="Docker容器(小鸡)"
+    elif [[ -f /proc/user_beancounters ]] || [[ -d /proc/vz ]]; then
+        virt_type="OpenVZ(小鸡)"
+    elif grep -qaE 'lxc|kubepods' /proc/1/cgroup 2>/dev/null || [[ "${container:-}" == "lxc" ]]; then
+        virt_type="LXC容器(小鸡)"
+    elif command -v systemd-detect-virt >/dev/null 2>&1; then
+        local v
+        v=$(systemd-detect-virt 2>/dev/null || true)
+        if [[ -n "$v" && "$v" != "none" ]]; then
+            virt_type="${v}(小鸡)"
+        fi
+    elif [[ -r /sys/class/dmi/id/product_name ]]; then
+        local prod
+        prod=$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)
+        case "$prod" in
+            *KVM*|*QEMU*) virt_type="KVM(小鸡)" ;;
+            *VMware*) virt_type="VMware(小鸡)" ;;
+            *VirtualBox*) virt_type="VirtualBox(小鸡)" ;;
+            *Xen*) virt_type="Xen(小鸡)" ;;
+            *Hyper-V*|*"Virtual Machine"*) virt_type="Hyper-V(小鸡)" ;;
+        esac
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        virt_type="macOS本机"
+    fi
+
+    echo "${os_name} · ${virt_type}"
+}
+
 print_banner() {
+    local host_env
+    host_env=$(detect_host_env)
     echo -e "${C_CYAN}${C_BOLD}"
     echo "================================================================"
     echo "              IPzhiliang · IP 质量一键交互检测工具"
     echo "================================================================"
     echo -e "${C_RESET}${C_DIM} 版本: v${VERSION}  |  核心引擎: xykt/IPQuality (IP.Check.Place)${C_RESET}"
+    echo -e "${C_DIM} 环境: ${host_env}${C_RESET}"
     echo -e "${C_DIM} 仓库: https://github.com/imthnio/IPzhiliang${C_RESET}"
     echo ""
 }
@@ -152,35 +197,30 @@ self_update() {
     fi
 }
 
-# 若以本地文件方式运行，轻量检查是否有新版本（2秒超时，不阻塞）
+# 若以本地文件方式运行，全自动检查并直接静默更新到最新版本（2秒超时，不阻塞）
 check_self_update() {
     local target_path="${BASH_SOURCE[0]:-}"
     if [[ -z "$target_path" || ! -f "$target_path" || "$target_path" == /dev/fd/* || "$target_path" == /proc/self/fd/* ]]; then
         return 0
     fi
-    [[ "$NON_INTERACTIVE" -eq 1 || "$DRY_RUN" -eq 1 ]] && return 0
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
 
     local remote_ver
     remote_ver=$(curl -fsL --connect-timeout 2 --max-time 3 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" 2>/dev/null | grep -m1 '^VERSION=' | cut -d'"' -f2)
     if [[ -n "$remote_ver" && "$remote_ver" != "$VERSION" ]]; then
-        echo -e "${C_YELLOW}[更新提醒] 检测到新版本 v${remote_ver} (当前 v${VERSION})。${C_RESET}"
-        local do_upd=""
-        tty_read "是否立即自动更新本地脚本并重新运行? [Y/n]: " do_upd
-        if [[ -z "$do_upd" || "$do_upd" =~ ^[Yy]$ ]]; then
-            local tmp_new
-            tmp_new=$(make_temp_file "ipzhiliang_update")
-            if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
-                chmod +x "$tmp_new"
-                mv "$tmp_new" "$target_path"
-                echo -e "${C_GREEN}[成功] 已更新至 v${remote_ver}，正在重启脚本...${C_RESET}"
-                echo ""
-                exec bash "$target_path"
-            else
-                rm -f "$tmp_new"
-                echo -e "${C_YELLOW}[提示] 自动更新失败，继续使用当前版本运行。${C_RESET}"
-            fi
+        echo -e "${C_CYAN}[自动更新] 发现新版本 v${remote_ver} (当前 v${VERSION})，正在自动更新...${C_RESET}"
+        local tmp_new
+        tmp_new=$(make_temp_file "ipzhiliang_update")
+        if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
+            chmod +x "$tmp_new"
+            mv "$tmp_new" "$target_path"
+            echo -e "${C_GREEN}[自动更新] 已更新至 v${remote_ver}，正在无缝启动新版...${C_RESET}"
+            echo ""
+            exec bash "$target_path" "$@"
+        else
+            rm -f "$tmp_new"
+            echo -e "${C_YELLOW}[提示] 自动更新拉取失败，继续使用当前版本运行。${C_RESET}"
         fi
-        echo ""
     fi
 }
 
@@ -987,7 +1027,7 @@ main() {
     parse_cli_args "$@"
     check_env
     print_banner
-    check_self_update
+    check_self_update "$@"
 
     if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
         show_summary

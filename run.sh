@@ -69,6 +69,10 @@ install_pkg() {
         $SUDO pacman -Sy --noconfirm $pkgs ca-certificates
     elif command -v zypper >/dev/null 2>&1; then
         $SUDO zypper --non-interactive install $pkgs ca-certificates
+    elif command -v opkg >/dev/null 2>&1; then
+        $SUDO opkg update && $SUDO opkg install $pkgs ca-bundle
+    elif command -v pkg >/dev/null 2>&1; then
+        $SUDO pkg install -y $pkgs ca_root_nss
     elif command -v brew >/dev/null 2>&1; then
         brew install $pkgs
     else
