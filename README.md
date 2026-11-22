@@ -13,6 +13,11 @@ bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhil
 ```
 
 > 也兼容管道方式运行：`curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh | bash`
+>
+> **Alpine Linux（默认无 `bash`/`curl`）一键运行**：
+> ```sh
+> apk add --no-cache bash curl && bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh)
+> ```
 
 ## 核心功能
 

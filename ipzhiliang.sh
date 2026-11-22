@@ -7,7 +7,7 @@
 
 set -u
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
 UPSTREAM_PRIMARY="https://IP.Check.Place"
 UPSTREAM_FALLBACK="https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh"
@@ -113,6 +113,20 @@ IPzhiliang v${VERSION} - IP 质量交互式一键检测脚本
 EOF
 }
 
+# 兼容 GNU / BusyBox(Alpine) / macOS 的安全临时文件创建函数
+make_temp_file() {
+    local prefix="${1:-ipzhiliang}"
+    local f=""
+    if command -v mktemp >/dev/null 2>&1; then
+        f=$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null) || f=""
+    fi
+    if [[ -z "$f" ]]; then
+        f="${TMPDIR:-/tmp}/${prefix}.$$.${RANDOM:-0}"
+        : > "$f"
+    fi
+    echo "$f"
+}
+
 # 本地脚本自更新
 self_update() {
     local target_path="${BASH_SOURCE[0]:-}"
@@ -123,7 +137,7 @@ self_update() {
 
     echo -e "${C_DIM}正在从 GitHub 拉取最新 ipzhiliang.sh ...${C_RESET}"
     local tmp_new
-    tmp_new=$(mktemp "${TMPDIR:-/tmp}/ipzhiliang_update.XXXXXX.sh")
+    tmp_new=$(make_temp_file "ipzhiliang_update")
     if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
         local new_ver
         new_ver=$(grep -m1 '^VERSION=' "$tmp_new" | cut -d'"' -f2)
@@ -154,7 +168,7 @@ check_self_update() {
         tty_read "是否立即自动更新本地脚本并重新运行? [Y/n]: " do_upd
         if [[ -z "$do_upd" || "$do_upd" =~ ^[Yy]$ ]]; then
             local tmp_new
-            tmp_new=$(mktemp "${TMPDIR:-/tmp}/ipzhiliang_update.XXXXXX.sh")
+            tmp_new=$(make_temp_file "ipzhiliang_update")
             if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
                 chmod +x "$tmp_new"
                 mv "$tmp_new" "$target_path"
@@ -730,7 +744,7 @@ show_summary() {
 }
 
 download_upstream_script() {
-    TMP_SCRIPT=$(mktemp "${TMPDIR:-/tmp}/ipzhiliang.XXXXXX.sh")
+    TMP_SCRIPT=$(make_temp_file "ipzhiliang")
     local ts
     ts=$(date +%s)
     echo -e "${C_DIM}正在实时拉取最新 IP 质量检测引擎与数据库...${C_RESET}"
