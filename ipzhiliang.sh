@@ -7,7 +7,7 @@
 
 set -u
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
 
 # 颜色定义
@@ -81,6 +81,11 @@ EMBEDDED_DNSBL_LIST=(
 )
 
 cleanup() {
+    local pids
+    pids=$(jobs -p 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        kill $pids 2>/dev/null || true
+    fi
     if [[ -n "$TMP_CURL_CFG" && -f "$TMP_CURL_CFG" ]]; then
         rm -f "$TMP_CURL_CFG"
     fi
@@ -89,7 +94,7 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
-trap 'cleanup; echo -e "\n${C_YELLOW}已取消检测。${C_RESET}"; exit 130' INT TERM
+trap 'cleanup; echo -e "\n${C_YELLOW}已取消检测。${C_RESET}"; exit 130' INT TERM HUP
 
 # ==============================================================================
 # 基础工具函数（兼容 Bash 3.2+ / macOS / Alpine / Debian / CentOS / OpenWrt / FreeBSD）
@@ -167,20 +172,49 @@ make_temp_dir() {
     echo "$d"
 }
 
-# 跨平台超时执行（兼容无 timeout 命令的 macOS）
+# 根据容器 cgroup pids.max 自动计算安全并发度（防止在 pids.max=64/128 的 LXD/LXC/NAT 小鸡上触发 fork 失败）
+detect_max_jobs() {
+    local pmax="" pcur=0 avail=0
+    if [[ -r /sys/fs/cgroup/pids.max ]]; then
+        pmax=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || true)
+        pcur=$(cat /sys/fs/cgroup/pids.current 2>/dev/null || echo 0)
+    elif [[ -r /sys/fs/cgroup/pids/pids.max ]]; then
+        pmax=$(cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || true)
+        pcur=$(cat /sys/fs/cgroup/pids/pids.current 2>/dev/null || echo 0)
+    fi
+
+    if [[ "$pmax" =~ ^[0-9]+$ && "$pcur" =~ ^[0-9]+$ ]]; then
+        avail=$(( pmax - pcur ))
+        if (( avail <= 35 )); then
+            echo 2
+        elif (( avail <= 90 )); then
+            echo 3
+        elif (( avail <= 160 )); then
+            echo 4
+        else
+            echo 6
+        fi
+    else
+        echo 5
+    fi
+}
+
+# 跨平台超时执行（兼容 BusyBox / GNU timeout -k 强杀与无 timeout 命令的 macOS）
 run_with_timeout() {
     local secs="$1"
     shift
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$secs" "$@"
+        timeout -k 1 "$secs" "$@"
     elif command -v gtimeout >/dev/null 2>&1; then
-        gtimeout "$secs" "$@"
+        gtimeout -k 1 "$secs" "$@"
     else
         "$@" &
         local cmd_pid=$!
         (
             sleep "$secs"
             kill -TERM "$cmd_pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$cmd_pid" 2>/dev/null || true
         ) &
         local wd_pid=$!
         wait "$cmd_pid" 2>/dev/null
@@ -281,11 +315,16 @@ detect_host_env() {
         os_name="$(uname -s) $(uname -r)"
     fi
 
-    if [[ -f /.dockerenv ]] || grep -qaE 'docker|containerd' /proc/1/cgroup 2>/dev/null; then
+    local pid1_env=""
+    if [[ -r /proc/1/environ ]]; then
+        pid1_env=$(tr '\0' '\n' < /proc/1/environ 2>/dev/null || true)
+    fi
+
+    if [[ -f /.dockerenv ]] || grep -qaE 'docker|containerd' /proc/1/cgroup 2>/dev/null || grep -qiE '^container=(docker|podman)' <<< "$pid1_env"; then
         virt_type="Docker容器(小鸡)"
     elif [[ -f /proc/user_beancounters ]] || [[ -d /proc/vz ]]; then
         virt_type="OpenVZ(小鸡)"
-    elif grep -qaE 'lxc|kubepods' /proc/1/cgroup 2>/dev/null || [[ "${container:-}" == "lxc" ]]; then
+    elif grep -qaE 'lxc|kubepods' /proc/1/cgroup 2>/dev/null || [[ "${container:-}" == "lxc" ]] || grep -qi '^container=lxc' <<< "$pid1_env"; then
         virt_type="LXC容器(小鸡)"
     else
         if command -v systemd-detect-virt >/dev/null 2>&1; then
@@ -1571,7 +1610,7 @@ load_dnsbl_list() {
     fi
 }
 
-# 并行 DNSBL 扫描：代理模式下强制走 DoH 经由代理查询，彻底防止本机 DNS 泄露
+# 分批限流并发 DNSBL 扫描（适配低 pids.max LXC/NAT 小鸡；代理模式下强制走 DoH 防本机 DNS 泄露）
 scan_dnsbl() {
     local ip="$1"
     local out_summary="$2"
@@ -1601,16 +1640,20 @@ scan_dnsbl() {
         zones=("zen.spamhaus.org" "${zones[@]}")
     fi
 
-    local idx=0
+    local max_jobs
+    max_jobs=$(detect_max_jobs)
+    local idx=0 batch_cnt=0
     for z in "${zones[@]}"; do
         idx=$((idx + 1))
+        batch_cnt=$((batch_cnt + 1))
         (
-            local ans=""
+            local ans="" raw_doh=""
             if [[ $use_doh -eq 1 ]]; then
-                ans=$(curl_exec -fsL --connect-timeout 3 --max-time 5 \
+                # 直接用正则提取 Answer 中的 127.x.x.x，避免在每个并发子进程中额外 fork jq 进程
+                raw_doh=$(curl_exec -fsL --connect-timeout 3 --max-time 5 \
                     -H "Accept: application/dns-json" \
-                    "https://dns.google/resolve?name=${rev_ip}.${z}&type=A" 2>/dev/null | \
-                    jq -r '.Answer[0].data // ""' 2>/dev/null || true)
+                    "https://dns.google/resolve?name=${rev_ip}.${z}&type=A" 2>/dev/null || true)
+                ans=$(grep -oE '"data":"127\.[0-9]+\.[0-9]+\.[0-9]+"' <<< "$raw_doh" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
             else
                 ans=$(dig +short +time=2 +tries=1 "${rev_ip}.${z}" A 2>/dev/null | head -n1 || true)
             fi
@@ -1621,6 +1664,11 @@ scan_dnsbl() {
                 echo "HIT|${z}|${ans}" > "${dnsbl_dir}/${idx}.res"
             fi
         ) &
+
+        if (( batch_cnt >= max_jobs )); then
+            wait
+            batch_cnt=0
+        fi
     done
     wait
 
@@ -1642,6 +1690,19 @@ scan_dnsbl() {
     local mode_tag="dig"
     [[ $use_doh -eq 1 ]] && mode_tag="DoH"
     printf '%d|%d|%d|%s\n' "$total" "$clean" "$hits" "$mode_tag" > "$out_summary"
+}
+
+# 直接探测单个 SMTP 25 端口（绝不使用 sh -c 管道，避免 BusyBox timeout 产生孤儿 nc 进程挂死）
+probe_smtp_host() {
+    local host="$1"
+    local bind_ip="${2:-}"
+    local resp=""
+    local -a nc_args=()
+    [[ -n "$bind_ip" ]] && nc_args+=("-s" "$bind_ip")
+    nc_args+=("-w" "2" "$host" "25")
+
+    resp=$(printf 'QUIT\r\n' | run_with_timeout 3 nc "${nc_args[@]}" 2>&1 || true)
+    [[ "$resp" == *"220"* ]]
 }
 
 # 邮局 25 端口连通性检测（代理模式下严格跳过直连，防止绕过代理泄露本机 IP）
@@ -1670,44 +1731,51 @@ scan_mail_port25() {
         return 0
     fi
 
-    # 测试本地出站 25 端口连通性（仅非占用时）
-    local nc_bind_opt=""
+    # 仅当目标 IP 确实配置在本机网卡上时才传 -s（兼容 NAT 内网小鸡）
+    local bind_ip=""
     if is_ipv4_literal "$ip"; then
-        # 检查该 IP 是否确实属于本机网卡（避免 NAT VPS 内网场景下 nc -s 公网IP 报错）
         if (command -v ip >/dev/null 2>&1 && ip addr show 2>/dev/null | grep -qw "$ip") || \
            (command -v ifconfig >/dev/null 2>&1 && ifconfig 2>/dev/null | grep -qw "$ip"); then
-            nc_bind_opt="-s $ip"
+            bind_ip="$ip"
         fi
     fi
 
-    local resp=""
     if [[ "$local_status" != "occupied" ]]; then
-        resp=$(run_with_timeout 5 sh -c "printf 'QUIT\r\n' | nc ${nc_bind_opt} -w 3 smtp.mailgun.org 25 2>&1" || true)
-        if [[ "$resp" == *"220"* ]]; then
+        if probe_smtp_host "smtp.mailgun.org" "$bind_ip"; then
             local_status="available"
         fi
     fi
 
-    # 并发探测主流邮局 MX 25 端口（仅当本地出站 25 端口可用或需验证时，耗时 <4s）
+    # 若本地出站 25 端口已被云商阻断，立即短路返回（避免无意义连发 6 次 25 端口探针拖慢速度或触发风控）
+    if [[ "$local_status" == "blocked" ]]; then
+        printf 'blocked|0||\n' > "$out_file"
+        return 0
+    fi
+
+    # 仅当 25 端口放行时，分批探测 6 大主流邮局 MX 连通性
     local mail_dir="${TMP_WORKDIR}/mail_jobs"
     mkdir -p "$mail_dir"
     rm -f "$mail_dir"/* 2>/dev/null || true
 
     local providers=("Gmail:gmail.com" "Outlook:outlook.com" "Yahoo:yahoo.com" "Apple:me.com" "QQ:qq.com" "163:163.com")
-    local entry name dom
+    local entry name dom batch_cnt=0
     if command -v dig >/dev/null 2>&1; then
         for entry in "${providers[@]}"; do
             name="${entry%%:*}"
             dom="${entry#*:}"
+            batch_cnt=$((batch_cnt + 1))
             (
-                local mx r ok=0
+                local mx ok=0
                 mx=$(dig +short +time=2 +tries=1 MX "$dom" 2>/dev/null | sort -n | head -n1 | awk '{print $2}')
-                if [[ -n "$mx" ]]; then
-                    r=$(run_with_timeout 4 sh -c "printf 'QUIT\r\n' | nc ${nc_bind_opt} -w 3 ${mx} 25 2>&1" || true)
-                    [[ "$r" == *"220"* ]] && ok=1
+                if [[ -n "$mx" ]] && probe_smtp_host "$mx" "$bind_ip"; then
+                    ok=1
                 fi
                 echo "${name}:${ok}" > "${mail_dir}/${name}.res"
             ) &
+            if (( batch_cnt >= 3 )); then
+                wait
+                batch_cnt=0
+            fi
         done
         wait
     fi
@@ -1965,25 +2033,27 @@ run_single_ip_check() {
     local run_dir="${TMP_WORKDIR}/run_${stack}_${RANDOM}"
     mkdir -p "$run_dir"
 
-    # ---------------- Phase 1: 并行查询 6 大独立 IP 情报库 ----------------
-    echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(1/3) 正在并行查询多源 IP 情报与风控数据库...${C_RESET}" >&2
+    # ---------------- Phase 1: 分批并发查询 6 大独立 IP 情报库（控制峰值 PID 数，兼容小鸡容器） ----------------
+    echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(1/3) 正在并发查询多源 IP 情报与风控数据库...${C_RESET}" >&2
     fetch_db_json "https://ipinfo.io/widget/demo/${ip}" "$stack" "${run_dir}/db_ipinfo.json" &
     fetch_db_json "https://api.ipquery.io/${ip}" "$stack" "${run_dir}/db_ipquery.json" &
     fetch_db_json "https://proxycheck.io/v2/${ip}?vpn=1&asn=1&risk=1" "$stack" "${run_dir}/db_proxycheck.json" &
+    fetch_scamalytics_data "$ip" "${run_dir}/db_scam.json" &
+    wait
     fetch_db_json "http://ip-api.com/json/${ip}?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,mobile,proxy,hosting" "$stack" "${run_dir}/db_ipapi.json" &
     fetch_db_json "https://api.ip2location.io/?ip=${ip}" "$stack" "${run_dir}/db_ip2loc.json" &
-    fetch_scamalytics_data "$ip" "${run_dir}/db_scam.json" &
     fetch_optional_byok "$ip" "$run_dir" &
     wait
     echo -ne "\r\033[2K" >&2
 
-    # ---------------- Phase 2: 并行检测 9 大 AI 与流媒体平台 ----------------
+    # ---------------- Phase 2: 分批并发检测 9 大 AI 与流媒体平台 ----------------
     if [[ "$SKIP_MEDIA" -eq 0 ]]; then
-        echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(2/3) 正在并行检测 AI (ChatGPT/Claude/Gemini) 与流媒体解锁...${C_RESET}" >&2
+        echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(2/3) 正在并发检测 AI (ChatGPT/Claude/Gemini) 与流媒体解锁...${C_RESET}" >&2
         probe_media_chatgpt "$stack" "${run_dir}/m_chatgpt.txt" &
         probe_media_claude "$stack" "${run_dir}/m_claude.txt" &
         probe_media_gemini "$stack" "${run_dir}/m_gemini.txt" &
         probe_media_netflix "$stack" "${run_dir}/m_netflix.txt" &
+        wait
         probe_media_disney "$stack" "${run_dir}/m_disney.txt" &
         probe_media_youtube "$stack" "${run_dir}/m_youtube.txt" &
         probe_media_tiktok "$stack" "${run_dir}/m_tiktok.txt" &
@@ -1993,13 +2063,12 @@ run_single_ip_check() {
         echo -ne "\r\033[2K" >&2
     fi
 
-    # ---------------- Phase 3: 并行扫描 DNSBL 黑名单 + 25 端口 ----------------
-    echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(3/3) 正在并行扫描 DNSBL 黑名单与邮局 25 端口...${C_RESET}" >&2
+    # ---------------- Phase 3: 顺序执行 DNSBL 限流并发扫描与 25 端口检测（彻底杜绝低 pids.max 容器 fork 失败） ----------------
+    echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(3/3) 正在扫描 DNSBL 黑名单与邮局 25 端口...${C_RESET}" >&2
     if [[ "$stack" == "4" ]]; then
-        scan_dnsbl "$ip" "${run_dir}/dnsbl_summary.txt" "${run_dir}/dnsbl_hits.txt" &
+        scan_dnsbl "$ip" "${run_dir}/dnsbl_summary.txt" "${run_dir}/dnsbl_hits.txt"
     fi
-    scan_mail_port25 "$ip" "${run_dir}/mail_summary.txt" &
-    wait
+    scan_mail_port25 "$ip" "${run_dir}/mail_summary.txt"
     echo -ne "\r\033[2K" >&2
 
     # ---------------- 聚合解析各数据源字段 ----------------
