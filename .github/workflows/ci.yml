@@ -1,0 +1,66 @@
+name: CI Checks
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Shell syntax checks
+        run: |
+          sh -n run.sh
+          bash -n ipzhiliang.sh
+
+      - name: Privacy, CLI & dry-run regression tests
+        run: |
+          set -e
+          export IPZHILIANG_SKIP_UPDATE=1
+
+          # Help & CLI validation
+          bash ipzhiliang.sh --help >/dev/null
+
+          # Verify missing argument flags exit cleanly without infinite loop
+          for flag in --port --iface -l -o --port= --iface= -l= -o=; do
+            if bash ipzhiliang.sh "$flag" >/dev/null 2>&1; then
+              echo "FAIL: $flag should have failed"
+              exit 1
+            fi
+          done
+
+          # Verify proxy password & public IP masking in privacy dry-run
+          OUT=$(bash ipzhiliang.sh --port "socks5h://testuser:s@cr:et@203.0.113.55:21233" --privacy --dry-run)
+          echo "$OUT"
+          echo "$OUT" | grep -q "testuser:\*\*\*@203\.\*\.\*\.55:21233"
+          if echo "$OUT" | grep -qE "s@cr:et|203\.0\.113\.55"; then
+            echo "FAIL: sensitive credential or public IP leaked!"
+            exit 1
+          fi
+
+          # Verify iface IPv4/IPv6 stack auto-alignment & masking
+          OUT2=$(bash ipzhiliang.sh --iface 203.0.113.55 -6 --privacy --dry-run)
+          echo "$OUT2"
+          echo "$OUT2" | grep -q "203\.\*\.\*\.55"
+          if echo "$OUT2" | grep -q "203\.0\.113\.55"; then
+            echo "FAIL: full iface IP leaked in privacy mode!"
+            exit 1
+          fi
+
+          # Verify zero references to external third-party relay scripts
+          if grep -iE "IP\.Check\.Place|Report\.Check\.Place|upload\.check\.place|hits\.xykt\.de|xykt/IPQuality" ipzhiliang.sh run.sh README.md; then
+            echo "FAIL: residual third-party upstream reference found!"
+            exit 1
+          fi
+
+      - name: Live IPv4 JSON smoke test
+        run: |
+          export IPZHILIANG_SKIP_UPDATE=1
+          JSON=$(bash ipzhiliang.sh -4 --privacy -j --no-mail)
+          echo "$JSON" | jq -e '.meta.tool == "IPzhiliang" and .meta.privacy_upload == false and (.basic.asn | length > 0)'

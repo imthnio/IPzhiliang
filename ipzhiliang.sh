@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# IPzhiliang - IP 质量交互式一键检测脚本
+# IPzhiliang - 独立开源 IP 质量与流媒体/AI 解锁一键检测工具
 # GitHub: https://github.com/imthnio/IPzhiliang
-# 上游核心检测引擎: https://github.com/xykt/IPQuality (https://IP.Check.Place)
+# License: MIT (100% 独立引擎 · 零第三方中转 · 零报告上传 · 零广告统计)
 # ==============================================================================
 
 set -u
 
-VERSION="1.3.0"
+VERSION="2.0.0"
 SELF_RAW_URL="https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh"
-UPSTREAM_PRIMARY="https://IP.Check.Place"
-UPSTREAM_FALLBACK="https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh"
 
 # 颜色定义
 C_RESET="\033[0m"
@@ -22,41 +20,82 @@ C_YELLOW="\033[33m"
 C_BLUE="\033[34m"
 C_PURPLE="\033[35m"
 C_CYAN="\033[36m"
+C_WHITE="\033[37m"
+
+BG_GREEN="\033[42m"
+BG_YELLOW="\033[43m"
+BG_RED="\033[41m"
+BG_BLUE="\033[44m"
+
+UA_CHROME="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
 # 运行配置状态
 TARGET_MODE="machine"      # machine | port | iface
 TARGET_PORTS=()            # 单个或多个端口/代理 URL
 TARGET_IFACE=""            # 网卡名或出口 IP
-PRIVACY_MODE="1"           # 1:隐私隐藏(-p) 2:公开隐藏 3:公开完整(-f) 4:本地完整(-p -f)
+PRIVACY_MODE="1"           # 1:隐私打码模式(默认,纯本地零上传) | 2:本地完整模式(-f,纯本地零上传)
 IP_STACK="both"            # both | 4 | 6
-LANG_CODE="cn"             # cn | en | jp | es | de | fr | ru | pt
-OUTPUT_FILE=""             # 导出文件路径
-JSON_MODE=0                # -j
-DEP_MODE="auto"            # default | auto(-y) | skip(-n)
-DRY_RUN=0                  # 仅展示命令不执行
+LANG_CODE="cn"             # cn | en
+OUTPUT_FILE=""             # 导出文件路径 (.txt / .ansi / .json)
+JSON_MODE=0                # -j 纯 JSON 输出
+DEP_MODE="auto"            # auto(-y) | skip(-n)
+SKIP_MAIL=0                # --no-mail 跳过 25 端口检测
+SKIP_MEDIA=0               # --no-media 跳过流媒体与 AI 检测
+DRY_RUN=0                  # 仅展示配置不执行
 NON_INTERACTIVE=0          # CLI 直通模式
 
-TMP_SCRIPT=""
+# 当前检测上下文
+ACTIVE_CURL_CFG=""
+ACTIVE_IFACE=""
+ACTIVE_PROXY_DISPLAY=""
+TMP_WORKDIR=""
 TMP_CURL_CFG=""
+
+# 内置已验证可用的 22 个权威公开 DNSBL 列表（同时支持读取同目录 dnsbl.list）
+EMBEDDED_DNSBL_LIST=(
+    "bl.spamcop.net"
+    "b.barracudacentral.org"
+    "dnsbl-1.uceprotect.net"
+    "dnsbl-2.uceprotect.net"
+    "dnsbl-3.uceprotect.net"
+    "dnsbl.dronebl.org"
+    "psbl.surriel.com"
+    "all.s5h.net"
+    "bl.mailspike.net"
+    "z.mailspike.net"
+    "rbl.interserver.net"
+    "spam.dnsbl.anonmails.de"
+    "dnsbl.justspam.org"
+    "bl.0spam.org"
+    "tor.dan.me.uk"
+    "bl.nordspam.com"
+    "dnsbl.spfbl.net"
+    "truncate.gbudb.net"
+    "bl.blocklist.de"
+    "korea.services.net"
+    "hostkarma.junkemailfilter.com"
+    "spam.rbl.blockedservers.com"
+)
 
 cleanup() {
     if [[ -n "$TMP_CURL_CFG" && -f "$TMP_CURL_CFG" ]]; then
         rm -f "$TMP_CURL_CFG"
     fi
-    if [[ -n "$TMP_SCRIPT" && -f "$TMP_SCRIPT" ]]; then
-        rm -f "$TMP_SCRIPT" "${TMP_SCRIPT}.patched"
+    if [[ -n "$TMP_WORKDIR" && -d "$TMP_WORKDIR" ]]; then
+        rm -rf "$TMP_WORKDIR"
     fi
 }
 trap cleanup EXIT
 trap 'cleanup; echo -e "\n${C_YELLOW}已取消检测。${C_RESET}"; exit 130' INT TERM
 
-# 检测当前进程是否拥有真正可打开的控制终端（修复无 TTY 会话下 [ -r /dev/tty ] 误判为真导致崩溃的问题）
+# ==============================================================================
+# 基础工具函数（兼容 Bash 3.2+ / macOS / Alpine / Debian / CentOS / OpenWrt / FreeBSD）
+# ==============================================================================
+
 has_controlling_tty() {
     (: </dev/tty) 2>/dev/null
 }
 
-# 兼容 `bash <(curl ...)` 和 `curl ... | bash` 的安全读取函数
-# 注意：内部变量使用 __tty_ 前缀，避免与调用方传入的变量名冲突；处理 EOF 防止死循环
 tty_read() {
     local __tty_prompt="$1"
     local __tty_var="$2"
@@ -88,7 +127,145 @@ tty_read() {
     printf -v "$__tty_var" '%s' "$__tty_val"
 }
 
-# 自动识别当前操作系统与虚拟化环境（母鸡/小鸡）
+make_temp_file() {
+    local prefix="${1:-ipzhiliang}"
+    local f=""
+    local old_umask
+    old_umask=$(umask)
+    umask 077
+    if command -v mktemp >/dev/null 2>&1; then
+        f=$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null) || f=""
+    fi
+    if [[ -z "$f" ]]; then
+        f="${TMPDIR:-/tmp}/${prefix}.$$.${RANDOM:-0}"
+        rm -f "$f" 2>/dev/null || true
+        : > "$f"
+    fi
+    chmod 600 "$f" 2>/dev/null || true
+    umask "$old_umask"
+    echo "$f"
+}
+
+make_temp_dir() {
+    local prefix="${1:-ipzhiliang_work}"
+    local d=""
+    local old_umask
+    old_umask=$(umask)
+    umask 077
+    if command -v mktemp >/dev/null 2>&1; then
+        d=$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null) || d=""
+    fi
+    if [[ -z "$d" ]]; then
+        d="${TMPDIR:-/tmp}/${prefix}.$$.${RANDOM:-0}"
+        mkdir -p "$d"
+    fi
+    chmod 700 "$d" 2>/dev/null || true
+    umask "$old_umask"
+    echo "$d"
+}
+
+# 跨平台超时执行（兼容无 timeout 命令的 macOS）
+run_with_timeout() {
+    local secs="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$secs" "$@"
+    else
+        "$@" &
+        local cmd_pid=$!
+        (
+            sleep "$secs"
+            kill -TERM "$cmd_pid" 2>/dev/null || true
+        ) &
+        local wd_pid=$!
+        wait "$cmd_pid" 2>/dev/null
+        local rc=$?
+        kill "$wd_pid" 2>/dev/null || true
+        wait "$wd_pid" 2>/dev/null || true
+        return "$rc"
+    fi
+}
+
+strip_ansi() {
+    local esc
+    esc=$(printf '\033')
+    sed "s/${esc}\[[0-9;]*[a-zA-Z]//g"
+}
+
+is_ephemeral_script_path() {
+    local p="${1:-}"
+    if [[ -z "$p" || ! -f "$p" || "$p" == /dev/fd/* || "$p" == /proc/self/fd/* || "$p" == */ipzhiliang_main.* || "${IPZHILIANG_BOOTSTRAPPED:-0}" == "1" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+self_update() {
+    local target_path="${BASH_SOURCE[0]:-}"
+    if is_ephemeral_script_path "$target_path"; then
+        echo -e "${C_GREEN}[提示] 你正在通过远程一键命令运行，每次执行均自动拉取最新独立版脚本。${C_RESET}"
+        exit 0
+    fi
+
+    echo -e "${C_DIM}正在从 GitHub 拉取最新 ipzhiliang.sh ...${C_RESET}"
+    local tmp_new
+    tmp_new=$(make_temp_file "ipzhiliang_update")
+    if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
+        local new_ver
+        new_ver=$(grep -m1 '^VERSION=' "$tmp_new" | cut -d'"' -f2)
+        chmod +x "$tmp_new" 2>/dev/null || true
+        if mv -f "$tmp_new" "$target_path" 2>/dev/null; then
+            echo -e "${C_GREEN}[成功] 已更新至最新版本 v${new_ver:-unknown} (${target_path})${C_RESET}"
+            exit 0
+        else
+            rm -f "$tmp_new"
+            echo -e "${C_RED}[错误] 无法写入 ${target_path}，请检查文件权限（如使用 sudo）。${C_RESET}"
+            exit 1
+        fi
+    else
+        rm -f "$tmp_new"
+        echo -e "${C_RED}[错误] 自更新失败，请检查网络连接后重试。${C_RESET}"
+        exit 1
+    fi
+}
+
+check_self_update() {
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    [[ "${IPZHILIANG_SKIP_UPDATE:-0}" == "1" ]] && return 0
+
+    local target_path="${BASH_SOURCE[0]:-}"
+    if is_ephemeral_script_path "$target_path"; then
+        return 0
+    fi
+
+    local remote_ver
+    remote_ver=$(curl -fsL --connect-timeout 2 --max-time 3 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" 2>/dev/null | grep -m1 '^VERSION=' | cut -d'"' -f2)
+    if [[ -n "$remote_ver" && "$remote_ver" != "$VERSION" ]]; then
+        echo -e "${C_CYAN}[自动更新] 发现新版本 v${remote_ver} (当前 v${VERSION})，正在自动更新...${C_RESET}"
+        local tmp_new
+        tmp_new=$(make_temp_file "ipzhiliang_update")
+        if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
+            local downloaded_ver
+            downloaded_ver=$(grep -m1 '^VERSION=' "$tmp_new" | cut -d'"' -f2)
+            chmod +x "$tmp_new" 2>/dev/null || true
+            if [[ -n "$downloaded_ver" && "$downloaded_ver" != "$VERSION" ]] && mv -f "$tmp_new" "$target_path" 2>/dev/null; then
+                echo -e "${C_GREEN}[自动更新] 已更新至 v${downloaded_ver}，正在无缝启动新版...${C_RESET}"
+                echo ""
+                export IPZHILIANG_SKIP_UPDATE=1
+                exec "${BASH:-bash}" "$target_path" "$@"
+            else
+                rm -f "$tmp_new"
+                echo -e "${C_YELLOW}[提示] 自动更新写入失败或版本未变更，继续使用当前版本运行。${C_RESET}"
+            fi
+        else
+            rm -f "$tmp_new"
+            echo -e "${C_YELLOW}[提示] 自动更新拉取失败，继续使用当前版本运行。${C_RESET}"
+        fi
+    fi
+}
+
 detect_host_env() {
     local os_name="Unknown"
     local virt_type="物理机(母鸡)"
@@ -133,14 +310,67 @@ detect_host_env() {
     echo "${os_name} · ${virt_type}"
 }
 
+install_missing_dep() {
+    local pkg="$1"
+    local sudo_cmd=""
+    if [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+        sudo_cmd="sudo"
+    fi
+    echo -e "${C_CYAN}[依赖安装] 正在自动安装 ${pkg}...${C_RESET}" >&2
+    if command -v apk >/dev/null 2>&1; then
+        $sudo_cmd apk add --no-cache "$pkg" >/dev/null 2>&1
+    elif command -v apt-get >/dev/null 2>&1; then
+        $sudo_cmd apt-get update -qq >/dev/null 2>&1 && $sudo_cmd apt-get install -y -qq "$pkg" >/dev/null 2>&1
+    elif command -v dnf >/dev/null 2>&1; then
+        $sudo_cmd dnf install -y -q "$pkg" >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        $sudo_cmd yum install -y -q "$pkg" >/dev/null 2>&1
+    elif command -v pacman >/dev/null 2>&1; then
+        $sudo_cmd pacman -Sy --noconfirm "$pkg" >/dev/null 2>&1
+    elif command -v zypper >/dev/null 2>&1; then
+        $sudo_cmd zypper --non-interactive install "$pkg" >/dev/null 2>&1
+    elif command -v opkg >/dev/null 2>&1; then
+        $sudo_cmd opkg update >/dev/null 2>&1 && $sudo_cmd opkg install "$pkg" >/dev/null 2>&1
+    elif command -v pkg >/dev/null 2>&1; then
+        $sudo_cmd pkg install -y "$pkg" >/dev/null 2>&1
+    elif command -v brew >/dev/null 2>&1; then
+        brew install "$pkg" >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+check_env() {
+    if ! command -v curl >/dev/null 2>&1; then
+        if [[ "$DEP_MODE" == "auto" && "$DRY_RUN" -eq 0 ]]; then
+            install_missing_dep curl || true
+        fi
+        if ! command -v curl >/dev/null 2>&1; then
+            echo -e "${C_RED}[错误] 未检测到 curl，请先安装 curl 后重试。${C_RESET}"
+            exit 1
+        fi
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        if [[ "$DEP_MODE" == "auto" && "$DRY_RUN" -eq 0 ]]; then
+            install_missing_dep jq || true
+        fi
+        if ! command -v jq >/dev/null 2>&1 && [[ "$DRY_RUN" -eq 0 ]]; then
+            echo -e "${C_RED}[错误] 未检测到 jq（JSON 解析依赖），请安装 jq 后重试：${C_RESET}"
+            echo -e "${C_DIM}  Debian/Ubuntu: apt install -y jq  |  Alpine: apk add jq  |  macOS: brew install jq${C_RESET}"
+            exit 1
+        fi
+    fi
+}
+
 print_banner() {
     local host_env
     host_env=$(detect_host_env)
     echo -e "${C_CYAN}${C_BOLD}"
     echo "================================================================"
-    echo "              IPzhiliang · IP 质量一键交互检测工具"
+    echo "          IPzhiliang · 独立隐私优先 IP 质量一键检测工具"
     echo "================================================================"
-    echo -e "${C_RESET}${C_DIM} 版本: v${VERSION}  |  核心引擎: xykt/IPQuality (IP.Check.Place)${C_RESET}"
+    echo -e "${C_RESET}${C_DIM} 版本: v${VERSION}  |  引擎: 独立自研并行引擎 (零中转 / 零上传 / 零广告)${C_RESET}"
     echo -e "${C_DIM} 环境: ${host_env}${C_RESET}"
     echo -e "${C_DIM} 仓库: https://github.com/imthnio/IPzhiliang${C_RESET}"
     echo ""
@@ -148,7 +378,7 @@ print_banner() {
 
 print_usage() {
     cat <<EOF
-IPzhiliang v${VERSION} - IP 质量交互式一键检测脚本
+IPzhiliang v${VERSION} - 独立开源、隐私优先的 IP 质量与流媒体/AI 解锁检测工具
 
 用法:
   交互式运行 (推荐):
@@ -160,157 +390,32 @@ IPzhiliang v${VERSION} - IP 质量交互式一键检测脚本
 选项:
   --port <目标>      检测指定端口/代理出口 (支持 21233 / 127.0.0.1:21233 / socks5://... / 多端口逗号分隔)
   --iface <网卡/IP>  检测指定出口网卡或出口 IP (如 eth0 / warp / 1.2.3.4)
-  --privacy          隐私保护模式：隐藏 IP 且不生成公开报告链接 (-p) [默认]
-  --public           公开分享模式：隐藏 IP 并生成公开报告链接
-  --full             展示完整 IP 地址 (-f)，可与 --privacy 或 --public 组合
+  --privacy          隐私打码模式：全程隐藏/打码公网 IP，纯本地零上传 [默认]
+  --full, -f         本地完整模式：仅在本地展示完整 IP，同样零上传
   -4                 仅检测 IPv4
   -6                 仅检测 IPv6
-  -l <语言>          报告语言: cn | en | jp | es | de | fr | ru | pt (默认 cn)
+  -l <语言>          报告语言: cn (中文) | en (English) [默认 cn]
   -E                 英文报告 (等同于 -l en)
-  -o <路径>          将报告保存到本地文件 (.txt / .ansi / .json，自动设置 0600 隐私权限)
-  -j                 以 JSON 格式输出
-  -y                 自动安装缺失依赖 [默认]
-  -n                 跳过系统与依赖检测
+  -o <路径>          将报告保存到本地文件 (.txt / .ansi / .json，自动设为 0600 权限)
+  -j                 在终端输出结构化 JSON 结果
+  --no-media         跳过 AI 与流媒体解锁检测
+  --no-mail          跳过 25 端口邮局连通性检测
+  -y                 自动安装缺失依赖 (curl / jq) [默认]
+  -n                 跳过依赖自动安装
   --update           将本地 ipzhiliang.sh 更新到 GitHub 最新版本
-  --dry-run          仅打印最终将执行的命令，不实际运行检测
+  --dry-run          仅预览检测配置，不发起实际网络检测
   -h, --help         显示本帮助信息
+
+可选自有 API Key 扩展（环境变量直连官方，不经任何中转）:
+  ABUSEIPDB_API_KEY  启用 AbuseIPDB 官方风控置信度查询
+  IPQS_API_KEY       启用 IPQualityScore 官方欺诈评分查询
 EOF
 }
 
-# 兼容 GNU / BusyBox(Alpine) / macOS 的安全临时文件创建函数（强制 0600 权限防同机其他用户窥探）
-make_temp_file() {
-    local prefix="${1:-ipzhiliang}"
-    local f=""
-    local old_umask
-    old_umask=$(umask)
-    umask 077
-    if command -v mktemp >/dev/null 2>&1; then
-        f=$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null) || f=""
-    fi
-    if [[ -z "$f" ]]; then
-        f="${TMPDIR:-/tmp}/${prefix}.$$.${RANDOM:-0}"
-        rm -f "$f" 2>/dev/null || true
-        : > "$f"
-    fi
-    chmod 600 "$f" 2>/dev/null || true
-    umask "$old_umask"
-    echo "$f"
-}
+# ==============================================================================
+# IP 校验、URL 编码与全链路隐私脱敏
+# ==============================================================================
 
-# 判断当前脚本是否属于远程流或 run.sh 引导的临时文件
-is_ephemeral_script_path() {
-    local p="${1:-}"
-    if [[ -z "$p" || ! -f "$p" || "$p" == /dev/fd/* || "$p" == /proc/self/fd/* || "$p" == */ipzhiliang_main.* || "${IPZHILIANG_BOOTSTRAPPED:-0}" == "1" ]]; then
-        return 0
-    fi
-    return 1
-}
-
-# 本地脚本自更新
-self_update() {
-    local target_path="${BASH_SOURCE[0]:-}"
-    if is_ephemeral_script_path "$target_path"; then
-        echo -e "${C_GREEN}[提示] 你正在通过远程一键命令运行，每次执行已自动拉取最新版脚本与检测数据库。${C_RESET}"
-        exit 0
-    fi
-
-    echo -e "${C_DIM}正在从 GitHub 拉取最新 ipzhiliang.sh ...${C_RESET}"
-    local tmp_new
-    tmp_new=$(make_temp_file "ipzhiliang_update")
-    if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
-        local new_ver
-        new_ver=$(grep -m1 '^VERSION=' "$tmp_new" | cut -d'"' -f2)
-        chmod +x "$tmp_new" 2>/dev/null || true
-        if mv -f "$tmp_new" "$target_path" 2>/dev/null; then
-            echo -e "${C_GREEN}[成功] 已更新至最新版本 v${new_ver:-unknown} (${target_path})${C_RESET}"
-            exit 0
-        else
-            rm -f "$tmp_new"
-            echo -e "${C_RED}[错误] 无法写入 ${target_path}，请检查文件权限（如使用 sudo）。${C_RESET}"
-            exit 1
-        fi
-    else
-        rm -f "$tmp_new"
-        echo -e "${C_RED}[错误] 自更新失败，请检查网络连接后重试。${C_RESET}"
-        exit 1
-    fi
-}
-
-# 若以本地文件方式运行，全自动检查并直接静默更新到最新版本（2秒超时，不阻塞，带防递归死循环保护）
-check_self_update() {
-    [[ "$DRY_RUN" -eq 1 ]] && return 0
-    [[ "${IPZHILIANG_SKIP_UPDATE:-0}" == "1" ]] && return 0
-
-    local target_path="${BASH_SOURCE[0]:-}"
-    if is_ephemeral_script_path "$target_path"; then
-        return 0
-    fi
-
-    local remote_ver
-    remote_ver=$(curl -fsL --connect-timeout 2 --max-time 3 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" 2>/dev/null | grep -m1 '^VERSION=' | cut -d'"' -f2)
-    if [[ -n "$remote_ver" && "$remote_ver" != "$VERSION" ]]; then
-        echo -e "${C_CYAN}[自动更新] 发现新版本 v${remote_ver} (当前 v${VERSION})，正在自动更新...${C_RESET}"
-        local tmp_new
-        tmp_new=$(make_temp_file "ipzhiliang_update")
-        if curl -fsL --connect-timeout 8 --max-time 20 -H "Cache-Control: no-cache" "${SELF_RAW_URL}?t=$(date +%s)" -o "$tmp_new" 2>/dev/null && grep -q "IPzhiliang" "$tmp_new"; then
-            local downloaded_ver
-            downloaded_ver=$(grep -m1 '^VERSION=' "$tmp_new" | cut -d'"' -f2)
-            chmod +x "$tmp_new" 2>/dev/null || true
-            if [[ -n "$downloaded_ver" && "$downloaded_ver" != "$VERSION" ]] && mv -f "$tmp_new" "$target_path" 2>/dev/null; then
-                echo -e "${C_GREEN}[自动更新] 已更新至 v${downloaded_ver}，正在无缝启动新版...${C_RESET}"
-                echo ""
-                export IPZHILIANG_SKIP_UPDATE=1
-                exec "${BASH4_BIN:-${BASH:-bash}}" "$target_path" "$@"
-            else
-                rm -f "$tmp_new"
-                echo -e "${C_YELLOW}[提示] 自动更新写入失败或版本未变更，继续使用当前版本运行。${C_RESET}"
-            fi
-        else
-            rm -f "$tmp_new"
-            echo -e "${C_YELLOW}[提示] 自动更新拉取失败，继续使用当前版本运行。${C_RESET}"
-        fi
-    fi
-}
-
-# 查找可用的 Bash >= 4.0（上游 IP.Check.Place 要求 Bash 4+）
-find_bash4() {
-    local candidates=("${BASH:-/bin/bash}" "/opt/homebrew/bin/bash" "/usr/local/bin/bash" "/usr/bin/bash" "/bin/bash")
-    local b ver
-    for b in "${candidates[@]}"; do
-        if [[ -x "$b" ]]; then
-            ver=$("$b" -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null || echo 0)
-            if [[ "$ver" =~ ^[0-9]+$ ]] && (( ver >= 4 )); then
-                echo "$b"
-                return 0
-            fi
-        fi
-    done
-    return 1
-}
-
-check_env() {
-    if ! command -v curl >/dev/null 2>&1; then
-        echo -e "${C_RED}[错误] 未检测到 curl，请先安装 curl 后重试。${C_RESET}"
-        echo -e "${C_DIM}  Debian/Ubuntu: apt update && apt install -y curl${C_RESET}"
-        echo -e "${C_DIM}  CentOS/RHEL:   yum install -y curl${C_RESET}"
-        exit 1
-    fi
-
-    if ! BASH4_BIN=$(find_bash4); then
-        if [[ "$DRY_RUN" -eq 1 ]]; then
-            BASH4_BIN="${BASH:-/bin/bash}"
-            echo -e "${C_YELLOW}[提示] 当前环境未检测到 Bash 4.0+（Dry-Run 模式继续预览；实际运行需 Bash 4.0+）。${C_RESET}"
-        else
-            echo -e "${C_RED}[错误] 上游检测引擎需要 Bash 4.0 及以上版本。${C_RESET}"
-            echo -e "${C_YELLOW}提示：${C_RESET}"
-            echo "  macOS 可运行: brew install bash"
-            echo "  Linux 可运行: bash <(curl -sL https://raw.githubusercontent.com/xykt/IPQuality/main/ref/upgrade_bash.sh)"
-            exit 1
-        fi
-    fi
-}
-
-# 判断字符串是否为合法 IPv4 字面量
 is_ipv4_literal() {
     local ip="$1"
     if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -327,26 +432,22 @@ is_ipv4_literal() {
     return 1
 }
 
-# 判断字符串是否为合法 IPv6 字面量
 is_ipv6_literal() {
     local ip="${1%%/*}"
     ip="${ip%%%*}"
     [[ "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:.]+$ ]]
 }
 
-# 判断字符串是否为合法 IPv4 或 IPv6 地址
 is_valid_ip_literal() {
     is_ipv4_literal "$1" || is_ipv6_literal "$1"
 }
 
-# 判断是否为本地回环地址
 is_loopback_host() {
     local h="${1#[}"
     h="${h%]}"
     [[ "$h" == "127."* || "$h" == "localhost" || "$h" == "::1" || "$h" == "0.0.0.0" || "$h" == "::" || "$h" == "*" ]]
 }
 
-# 对代理用户名或密码进行安全 URL 编码（保留已有的 %XX 转义，防止密码含 @ : / # ? 等特殊字符导致 curl 报错）
 urlencode_cred() {
     local LC_ALL=C
     local str="$1"
@@ -367,7 +468,6 @@ urlencode_cred() {
     printf '%s' "$out"
 }
 
-# 规范化用户直接输入的代理地址中的认证信息（若密码包含未编码的 @ 或 :，自动完成 URL 编码）
 normalize_proxy_auth() {
     local url="$1"
     if [[ "$url" != *"@"* ]]; then
@@ -382,7 +482,6 @@ normalize_proxy_auth() {
         rest="${url#*://}"
     fi
 
-    # 始终按最后一个 @ 切分凭据与主机地址，防止密码本身包含 @
     local creds="${rest%@*}"
     local hostpart="${rest##*@}"
 
@@ -395,7 +494,7 @@ normalize_proxy_auth() {
     fi
 }
 
-# 打码 IPv4/IPv6 用于隐私预览（保留首段与尾段，中间打码：既严防泄露完整 IP，又能清晰区分同 C 段/同前缀下的多出口 IP）
+# 保留首段与末段、中间段打码：既严格保护公网 IP，又能区分同 C 段/同前缀多出口 IP
 mask_ip() {
     local raw="$1"
     local ip="${raw%%/*}"
@@ -424,7 +523,15 @@ mask_ip() {
     fi
 }
 
-# 隐藏代理 URL 中的密码（以及在隐藏 IP 模式下对非本地远程代理服务器公网 IP 进行打码）
+format_ip_display() {
+    local ip="$1"
+    if [[ "$PRIVACY_MODE" == "2" ]]; then
+        echo "$ip"
+    else
+        mask_ip "$ip"
+    fi
+}
+
 mask_proxy_url() {
     local url="$1"
     local mask_remote_host="${2:-1}"
@@ -449,8 +556,7 @@ mask_proxy_url() {
         fi
     fi
 
-    # 若需要在隐私模式下隐藏远程代理主机公网 IP（保留本地 127.0.0.1 / localhost / ::1 不打码）
-    if [[ "$mask_remote_host" == "1" && ( "$PRIVACY_MODE" == "1" || "$PRIVACY_MODE" == "2" ) ]]; then
+    if [[ "$mask_remote_host" == "1" && "$PRIVACY_MODE" == "1" ]]; then
         local host_only="" port_part=""
         if [[ "$hostpart" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
             host_only="${BASH_REMATCH[1]}"
@@ -476,12 +582,19 @@ mask_proxy_url() {
     fi
 }
 
-# 对监听地址如 203.0.113.55:443 中的公网 IP 进行打码，防止端口提示列表泄露本机公网 IP
+format_iface_display() {
+    local val="$1"
+    if [[ "$PRIVACY_MODE" == "1" ]] && is_valid_ip_literal "$val"; then
+        mask_ip "$val"
+    else
+        echo "$val"
+    fi
+}
+
 mask_listen_addr() {
     awk '{
         addr = $1
         proc = (NF > 1 ? " " $2 : "")
-        # 匹配 [IPv6]:port 或 IPv4:port
         if (match(addr, /^\[[^\]]+\]:[0-9]+$/)) {
             sep = index(addr, "]:")
             host = substr(addr, 2, sep - 2)
@@ -506,7 +619,65 @@ mask_listen_addr() {
     }'
 }
 
-# 检测端口是否在本机监听，并返回监听地址提示（兼容 Linux ss/netstat 与 macOS/FreeBSD lsof）
+# ==============================================================================
+# 统一隔离 HTTP 客户端（确保所有网络请求严格走选定代理/网卡且零 ps aux 密码泄露）
+# ==============================================================================
+
+curl_exec() {
+    local -a opts=()
+    if [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]]; then
+        opts+=("-K" "$ACTIVE_CURL_CFG")
+    elif [[ -n "$ACTIVE_IFACE" ]]; then
+        opts+=("--interface" "$ACTIVE_IFACE")
+    fi
+    curl ${opts[@]+"${opts[@]}"} "$@"
+}
+
+# 带指定 IP 栈的 curl（代理模式下不强制本地 socket 栈，以免干扰 127.0.0.1 代理连接）
+curl_exec_stack() {
+    local stack="$1"
+    shift
+    if [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]]; then
+        curl -K "$ACTIVE_CURL_CFG" "$@"
+    elif [[ -n "$ACTIVE_IFACE" ]]; then
+        curl --interface "$ACTIVE_IFACE" "-${stack}" "$@"
+    else
+        curl "-${stack}" "$@"
+    fi
+}
+
+# 获取出口 IPv4（使用纯 IPv4 域名，确保 socks5h 代理下也能精准获取代理 IPv4）
+fetch_egress_ipv4() {
+    local ep ip
+    local endpoints=("https://api.ipify.org" "https://ipv4.icanhazip.com" "https://v4.ident.me" "https://4.ipw.cn")
+    for ep in "${endpoints[@]}"; do
+        ip=$(curl_exec_stack 4 -fsL --connect-timeout 3 --max-time 5 "$ep" 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$ip" ]] && is_ipv4_literal "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 获取出口 IPv6（使用纯 IPv6 域名，确保 socks5h 代理下也能精准获取代理 IPv6）
+fetch_egress_ipv6() {
+    local ep ip
+    local endpoints=("https://api6.ipify.org" "https://ipv6.icanhazip.com" "https://v6.ident.me" "https://6.ipw.cn")
+    for ep in "${endpoints[@]}"; do
+        ip=$(curl_exec_stack 6 -fsL --connect-timeout 3 --max-time 5 "$ep" 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$ip" ]] && is_ipv6_literal "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ==============================================================================
+# 端口探测与交互配置
+# ==============================================================================
+
 check_local_port_listen() {
     local port="$1"
     local out=""
@@ -522,7 +693,6 @@ check_local_port_listen() {
     [[ -n "$out" ]] && echo "$out"
 }
 
-# 列出本机正在监听的常用本地端口（辅助用户参考，自动去重并脱敏绑定的公网 IP）
 show_listening_ports_hint() {
     local lines=""
     if command -v ss >/dev/null 2>&1; then
@@ -542,11 +712,10 @@ show_listening_ports_hint() {
     fi
 }
 
-# 通过指定代理探测出口 IP（使用 curl -K - 从标准输入传入代理，防止 ps aux 泄露代理密码；校验返回值为合法 IP）
 probe_proxy_ip() {
     local proxy_url="$1"
     local ip=""
-    local endpoints=("https://api64.ipify.org" "https://myip.check.place" "https://icanhazip.com" "https://ifconfig.me/ip")
+    local endpoints=("https://api64.ipify.org" "https://icanhazip.com" "https://ifconfig.me/ip")
     local ep
     for ep in "${endpoints[@]}"; do
         ip=$(printf 'proxy = "%s"\n' "$proxy_url" | curl -K - -fsL --connect-timeout 4 --max-time 6 "$ep" 2>/dev/null | tr -d '[:space:]')
@@ -558,7 +727,6 @@ probe_proxy_ip() {
     return 1
 }
 
-# 自动探测纯端口或 host:port 的代理协议 (socks5h -> http -> https)
 resolve_port_to_proxy() {
     local raw
     raw=$(normalize_proxy_auth "$1")
@@ -566,8 +734,8 @@ resolve_port_to_proxy() {
     local hostport=""
     local probed_ip=""
 
-    # 如果已经是完整协议 URL，直接验证连通性
     if [[ "$raw" =~ ^(socks5h?|socks4a?|https?):// ]]; then
+        # 将 socks5:// 提醒或保持原协议（推荐 socks5h 防止本地 DNS 泄露）
         echo -e "${C_DIM}正在测试代理连通性: $(mask_proxy_url "$raw") ...${C_RESET}" >&2
         if probed_ip=$(probe_proxy_ip "$raw"); then
             echo -e "${C_GREEN}[成功] 代理连通！出口 IP 预览: $(mask_ip "$probed_ip")${C_RESET}" >&2
@@ -580,7 +748,6 @@ resolve_port_to_proxy() {
         fi
     fi
 
-    # 纯端口号 -> 补全 127.0.0.1:PORT
     if [[ "$raw" =~ ^[0-9]+$ ]]; then
         if (( 10#$raw < 1 || 10#$raw > 65535 )); then
             echo -e "${C_RED}[错误] 端口号必须在 1-65535 之间: $raw${C_RESET}" >&2
@@ -593,7 +760,6 @@ resolve_port_to_proxy() {
             echo -e "${C_YELLOW}[提示] 未在本地监听列表中发现端口 ${raw}，仍将尝试连接 127.0.0.1:${raw}...${C_RESET}" >&2
         fi
     else
-        # 校验形如 host:port 末尾的端口范围
         if [[ "$raw" =~ :([0-9]+)$ ]]; then
             local extracted_port="${BASH_REMATCH[1]}"
             if (( 10#$extracted_port < 1 || 10#$extracted_port > 65535 )); then
@@ -606,7 +772,7 @@ resolve_port_to_proxy() {
 
     local masked_hp
     masked_hp=$(mask_proxy_url "${auth_prefix}${hostport}")
-    echo -e "${C_DIM}正在自动探测 ${masked_hp} 的代理协议 (SOCKS5 / HTTP / HTTPS)...${C_RESET}" >&2
+    echo -e "${C_DIM}正在自动探测 ${masked_hp} 的代理协议 (SOCKS5H / HTTP / HTTPS)...${C_RESET}" >&2
     local proto candidate
     for proto in socks5h http https; do
         candidate="${proto}://${auth_prefix}${hostport}"
@@ -628,7 +794,6 @@ resolve_port_to_proxy() {
     return 1
 }
 
-# 交互步骤 1：选择检测目标
 step_select_target() {
     echo -e "${C_BOLD}${C_BLUE}[1/3] 请选择检测目标：${C_RESET}"
     echo -e "  ${C_GREEN}1)${C_RESET} 检测整台机器（默认出口 IP） ${C_DIM}[默认]${C_RESET}"
@@ -670,10 +835,10 @@ configure_port_target() {
     echo ""
     show_listening_ports_hint
     echo -e "${C_CYAN}支持输入格式：${C_RESET}"
-    echo "  - 纯端口号（自动探测 SOCKS5/HTTP/HTTPS）:  21233"
+    echo "  - 纯端口号（自动探测 SOCKS5H/HTTP/HTTPS）: 21233"
     echo "  - 多个端口批量检测（英文逗号分隔）:        21233,21234"
     echo "  - 主机与端口:                              127.0.0.1:21233"
-    echo "  - 完整代理地址:                            socks5://user:pass@127.0.0.1:21233"
+    echo "  - 完整代理地址:                            socks5h://user:pass@127.0.0.1:21233"
     echo ""
 
     while true; do
@@ -690,7 +855,6 @@ configure_port_target() {
             continue
         fi
 
-        # 询问是否需要账号密码（仅当输入中不含 @ 且不含 :// 时）
         local auth_prefix=""
         if [[ "$raw_input" != *"://"* && "$raw_input" != *"@"* ]]; then
             local need_auth=""
@@ -705,7 +869,6 @@ configure_port_target() {
             fi
         fi
 
-        # 解析逗号分隔的多目标
         TARGET_PORTS=()
         local IFS=','
         local items=($raw_input)
@@ -740,7 +903,6 @@ configure_port_target() {
                     break
                 fi
             else
-                # 探测失败，允许用户手动指定协议强行测试
                 echo ""
                 echo -e "可选操作: ${C_GREEN}1)${C_RESET} 重新输入  ${C_GREEN}2)${C_RESET} 手动指定协议强制使用  ${C_GREEN}3)${C_RESET} 改用指定网卡/出口 IP"
                 local retry_opt=""
@@ -849,7 +1011,6 @@ configure_iface_target() {
         fi
         if [[ "$iface_input" =~ ^[0-9]+$ ]] && (( 10#$iface_input >= 1 && 10#$iface_input <= ${#iface_ips[@]} )); then
             local raw_selected_ip="${iface_ips[$((10#$iface_input - 1))]}"
-            # 去掉 /CIDR 前缀，直接精准绑定到所选的具体出口 IP
             TARGET_IFACE="${raw_selected_ip%%/*}"
         else
             TARGET_IFACE="${iface_input%%/*}"
@@ -858,7 +1019,6 @@ configure_iface_target() {
     done
 }
 
-# 若 TARGET_IFACE 是具体 IPv4 或 IPv6 字面量，自动对齐 IP_STACK 防止协议栈与出口 IP 类型冲突
 align_iface_ip_stack() {
     [[ "$TARGET_MODE" != "iface" || -z "$TARGET_IFACE" ]] && return 0
     if is_ipv4_literal "$TARGET_IFACE"; then
@@ -874,28 +1034,24 @@ align_iface_ip_stack() {
     fi
 }
 
-# 交互步骤 2：选择隐私与公开模式
 step_select_privacy() {
-    echo -e "${C_BOLD}${C_BLUE}[2/3] 请选择隐私与报告公开方式：${C_RESET}"
-    echo -e "  ${C_GREEN}1)${C_RESET} 隐私保护模式：隐藏/打码 IP + 不上传生成公开报告链接 ${C_DIM}(-p) [默认推荐]${C_RESET}"
-    echo -e "  ${C_GREEN}2)${C_RESET} 公开分享模式：隐藏/打码 IP + 生成可分享的公开报告链接"
-    echo -e "  ${C_GREEN}3)${C_RESET} 公开完整模式：展示完整 IP + 生成可分享的公开报告链接 ${C_DIM}(-f)${C_RESET}"
-    echo -e "  ${C_GREEN}4)${C_RESET} 本地完整模式：展示完整 IP + 不上传生成公开报告链接 ${C_DIM}(-p -f)${C_RESET}"
+    echo -e "${C_BOLD}${C_BLUE}[2/3] 请选择 IP 显示隐私方式（全程纯本地运行，绝不上传任何报告）：${C_RESET}"
+    echo -e "  ${C_GREEN}1)${C_RESET} 隐私打码模式：全程隐藏/打码公网 IP (如 203.*.*.55) ${C_DIM}[默认推荐]${C_RESET}"
+    echo -e "  ${C_GREEN}2)${C_RESET} 本地完整模式：仅在本地终端展示完整 IP 地址 ${C_DIM}(-f)${C_RESET}"
     echo ""
 
     local choice=""
-    tty_read "请输入选项 [1-4] (默认 1): " choice
+    tty_read "请输入选项 [1-2] (默认 1): " choice
     case "${choice:-1}" in
-        1|2|3|4) PRIVACY_MODE="${choice:-1}" ;;
+        1|2) PRIVACY_MODE="${choice:-1}" ;;
         *)
-            echo -e "${C_YELLOW}无效选项，默认使用隐私保护模式。${C_RESET}"
+            echo -e "${C_YELLOW}无效选项，默认使用隐私打码模式。${C_RESET}"
             PRIVACY_MODE="1"
             ;;
     esac
     echo ""
 }
 
-# 交互步骤 3：选择 IP 协议栈
 step_select_ip_stack() {
     if [[ "$TARGET_MODE" == "iface" && -n "$TARGET_IFACE" ]]; then
         if is_ipv4_literal "$TARGET_IFACE"; then
@@ -928,39 +1084,33 @@ step_select_ip_stack() {
     echo ""
 }
 
-# 校验并标准化语言代码（兼容用户输入 zh / ja / en-us 等常见写法）
 normalize_lang_code() {
     local code
     code=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
     case "$code" in
         cn|zh|zh-cn|zh_cn|chs) echo "cn" ;;
         en|en-us|en_us|eng)    echo "en" ;;
-        jp|ja|ja-jp|ja_jp)     echo "jp" ;;
-        es|de|fr|ru|pt)        echo "$code" ;;
         *)                     return 1 ;;
     esac
     return 0
 }
 
-# 可选高级选项菜单
 step_advanced_options() {
     echo ""
     echo -e "${C_BOLD}${C_PURPLE}=== 高级选项设置 ===${C_RESET}"
 
-    # 1. 报告语言
     echo -e "1) 报告语言 (当前: ${C_CYAN}${LANG_CODE}${C_RESET})"
-    echo "   可选: cn (中文) | en (English) | jp | es | de | fr | ru | pt"
+    echo "   可选: cn (中文) | en (English)"
     local lang_in="" norm_lang=""
     tty_read "   请输入语言代码 (直接回车保持 ${LANG_CODE}): " lang_in
     if [[ -n "$lang_in" ]]; then
         if norm_lang=$(normalize_lang_code "$lang_in"); then
             LANG_CODE="$norm_lang"
         else
-            echo -e "   ${C_YELLOW}[提示] 不支持的语言代码 '${lang_in}'，保持为 ${LANG_CODE}。${C_RESET}"
+            echo -e "   ${C_YELLOW}[提示] 支持 cn / en，保持为 ${LANG_CODE}。${C_RESET}"
         fi
     fi
 
-    # 2. 保存报告到本地文件
     echo ""
     echo -e "2) 导出报告到本地文件 (当前: ${C_CYAN}${OUTPUT_FILE:-不导出}${C_RESET})"
     echo "   支持后缀: .txt (纯文本) / .ansi (保留终端配色) / .json (JSON数据)"
@@ -975,7 +1125,6 @@ step_advanced_options() {
         OUTPUT_FILE="$out_in"
     fi
 
-    # 3. 终端 JSON 输出
     echo ""
     local json_in=""
     tty_read "3) 是否在终端以纯 JSON 格式输出? [y/N] (当前: $([[ $JSON_MODE -eq 1 ]] && echo 是 || echo 否)): " json_in
@@ -985,115 +1134,24 @@ step_advanced_options() {
         JSON_MODE=0
     fi
 
-    # 4. 依赖处理策略
     echo ""
-    echo -e "4) 缺失依赖处理方式 (当前: ${C_CYAN}${DEP_MODE}${C_RESET})"
-    echo "   1) 自动安装缺失依赖 (-y，推荐不中断)"
-    echo "   2) 跳过系统与依赖检测 (-n，适合已装全依赖的极速运行)"
-    echo "   3) 交给上游脚本默认交互"
-    local dep_in=""
-    tty_read "   请选择 [1-3] (直接回车保持不变): " dep_in
-    case "$dep_in" in
-        1) DEP_MODE="auto" ;;
-        2) DEP_MODE="skip" ;;
-        3) DEP_MODE="default" ;;
-    esac
+    local media_in=""
+    tty_read "4) 是否检测 AI 与流媒体解锁? [Y/n] (当前: $([[ $SKIP_MEDIA -eq 0 ]] && echo 开启 || echo 关闭)): " media_in
+    if [[ "$media_in" =~ ^[Nn]$ ]]; then
+        SKIP_MEDIA=1
+    elif [[ "$media_in" =~ ^[Yy]$ ]]; then
+        SKIP_MEDIA=0
+    fi
+
     echo ""
-}
-
-# 根据当前状态拼装上游 IP.Check.Place 参数数组（针对单个代理/目标）
-build_upstream_args() {
-    local proxy_override="${1:-}"
-    local output_override="${2:-}"
-    UPSTREAM_ARGS=()
-
-    # IP 协议栈（必须置于 -i / -x 之前，确保 get_opts 先设置 IPV4check/IPV6check）
-    [[ "$IP_STACK" == "4" ]] && UPSTREAM_ARGS+=("-4")
-    [[ "$IP_STACK" == "6" ]] && UPSTREAM_ARGS+=("-6")
-
-    # 隐私与公开设置
-    case "$PRIVACY_MODE" in
-        1) UPSTREAM_ARGS+=("-p") ;;
-        2) ;; # 默认：打码 IP + 公开报告链接
-        3) UPSTREAM_ARGS+=("-f") ;;
-        4) UPSTREAM_ARGS+=("-p" "-f") ;;
-    esac
-
-    # 检测目标
-    if [[ "$TARGET_MODE" == "port" && -n "$proxy_override" ]]; then
-        UPSTREAM_ARGS+=("-x" "$proxy_override")
-    elif [[ "$TARGET_MODE" == "iface" && -n "$TARGET_IFACE" ]]; then
-        UPSTREAM_ARGS+=("-i" "$TARGET_IFACE")
+    local mail_in=""
+    tty_read "5) 是否检测 25 端口邮局连通性? [Y/n] (当前: $([[ $SKIP_MAIL -eq 0 ]] && echo 开启 || echo 关闭)): " mail_in
+    if [[ "$mail_in" =~ ^[Nn]$ ]]; then
+        SKIP_MAIL=1
+    elif [[ "$mail_in" =~ ^[Yy]$ ]]; then
+        SKIP_MAIL=0
     fi
-
-    # 语言
-    if [[ "$LANG_CODE" == "en" ]]; then
-        UPSTREAM_ARGS+=("-E")
-    elif [[ -n "$LANG_CODE" && "$LANG_CODE" != "cn" ]]; then
-        UPSTREAM_ARGS+=("-l" "$LANG_CODE")
-    fi
-
-    # 导出文件
-    if [[ -n "$output_override" ]]; then
-        UPSTREAM_ARGS+=("-o" "$output_override")
-    fi
-
-    # JSON 输出
-    [[ "$JSON_MODE" -eq 1 ]] && UPSTREAM_ARGS+=("-j")
-
-    # 依赖策略
-    [[ "$DEP_MODE" == "auto" ]] && UPSTREAM_ARGS+=("-y")
-    [[ "$DEP_MODE" == "skip" ]] && UPSTREAM_ARGS+=("-n")
-}
-
-# 根据当前隐私模式格式化网卡/出口 IP 用于屏幕显示
-format_iface_display() {
-    local val="$1"
-    if [[ ( "$PRIVACY_MODE" == "1" || "$PRIVACY_MODE" == "2" ) ]] && is_valid_ip_literal "$val"; then
-        mask_ip "$val"
-    else
-        echo "$val"
-    fi
-}
-
-# 生成安全脱敏后的命令预览字符串
-format_preview_cmd() {
-    local preview="bash <(curl -Ls https://IP.Check.Place)"
-    local next_type=""
-    local arg
-    for arg in "${UPSTREAM_ARGS[@]}"; do
-        if [[ "$next_type" == "proxy" ]]; then
-            preview+=" '$(mask_proxy_url "$arg")'"
-            next_type=""
-            continue
-        elif [[ "$next_type" == "iface" ]]; then
-            preview+=" '$(format_iface_display "$arg")'"
-            next_type=""
-            continue
-        elif [[ "$next_type" == "out" ]]; then
-            preview+=" '$arg'"
-            next_type=""
-            continue
-        fi
-        case "$arg" in
-            -x)
-                preview+=" -x"
-                next_type="proxy"
-                ;;
-            -i)
-                preview+=" -i"
-                next_type="iface"
-                ;;
-            -o)
-                preview+=" -o"
-                next_type="out"
-                ;;
-            *)
-                preview+=" $arg"
-                ;;
-        esac
-    done
-    echo "$preview"
+    echo ""
 }
 
 show_summary() {
@@ -1116,155 +1174,1161 @@ show_summary() {
             ;;
     esac
 
-    case "$PRIVACY_MODE" in
-        1) echo -e "  隐私模式: ${C_GREEN}隐私保护 (隐藏 IP + 不上传公开报告)${C_RESET}" ;;
-        2) echo -e "  隐私模式: ${C_YELLOW}公开分享 (隐藏 IP + 生成公开报告链接)${C_RESET}" ;;
-        3) echo -e "  隐私模式: ${C_YELLOW}公开完整 (显示完整 IP + 生成公开报告链接)${C_RESET}" ;;
-        4) echo -e "  隐私模式: ${C_GREEN}本地完整 (显示完整 IP + 不上传公开报告)${C_RESET}" ;;
-    esac
+    if [[ "$PRIVACY_MODE" == "1" ]]; then
+        echo -e "  隐私模式: ${C_GREEN}隐私打码 (隐藏 IP · 纯本地零上传)${C_RESET}"
+    else
+        echo -e "  隐私模式: ${C_GREEN}本地完整 (展示完整 IP · 纯本地零上传)${C_RESET}"
+    fi
 
     local stack_label="双栈 (IPv4 + IPv6)"
     [[ "$IP_STACK" == "4" ]] && stack_label="仅 IPv4"
     [[ "$IP_STACK" == "6" ]] && stack_label="仅 IPv6"
     echo -e "  协议版本: ${stack_label}"
     echo -e "  报告语言: ${LANG_CODE}"
-    [[ -n "$OUTPUT_FILE" ]] && echo -e "  导出文件: ${OUTPUT_FILE}"
+    [[ -n "$OUTPUT_FILE" ]] && echo -e "  导出文件: ${OUTPUT_FILE} (0600 权限)"
     [[ "$JSON_MODE" -eq 1 ]] && echo -e "  JSON输出: 开启"
-    echo -e "  依赖策略: ${DEP_MODE}"
-
-    # 展示等价命令
-    if [[ "$TARGET_MODE" == "port" ]]; then
-        build_upstream_args "${TARGET_PORTS[0]}" "$OUTPUT_FILE"
-    else
-        build_upstream_args "" "$OUTPUT_FILE"
-    fi
-    echo -e "  等价命令: ${C_DIM}$(format_preview_cmd)${C_RESET}"
-    if [[ "$TARGET_MODE" == "port" && ${#TARGET_PORTS[@]} -gt 1 ]]; then
-        echo -e "            ${C_DIM}(共 ${#TARGET_PORTS[@]} 个端口将依次自动检测)${C_RESET}"
+    [[ "$SKIP_MEDIA" -eq 1 ]] && echo -e "  流媒体/AI: 跳过"
+    [[ "$SKIP_MAIL" -eq 1 ]] && echo -e "  25端口检测: 跳过"
+    if [[ -n "${ABUSEIPDB_API_KEY:-}" || -n "${IPQS_API_KEY:-}" ]]; then
+        echo -e "  自有Key:  ${C_GREEN}已启用扩展风控库${C_RESET}"
     fi
     echo -e "${C_BOLD}${C_CYAN}==========================================================${C_RESET}"
 }
 
-# 对拉取到的上游脚本实施隐私加固与缺陷修复（语法校验通过后生效，100% 向后兼容）
-patch_upstream_script() {
-    local script_file="$1"
-    local patched_file="${script_file}.patched"
-    local no_upload="0"
-    [[ "$PRIVACY_MODE" == "1" || "$PRIVACY_MODE" == "4" ]] && no_upload="1"
+# ==============================================================================
+# 独立自研核心检测引擎：Phase 1 多源情报并行查询
+# ==============================================================================
 
-    awk -v privacy_no_upload="$no_upload" '
-    # 1. 进度条隐藏完整 IP（非 -f 模式下使用 $IPhide，彻底杜绝检测过程中终端实时进度条泄露完整 IP）
-    /echo -ne "\\r\$Font_Cyan\$Font_B\[\$IP\]#/ {
-        gsub(/\[\$IP\]#/, "[$(if [ $fullIP -eq 1 ]; then echo \"$IP\"; else echo \"${IPhide:-$IP}\"; fi)]#")
-    }
-    # 2. check_connectivity 走代理/指定网卡 ($CurlARG)，防止旁路裸连泄露宿主机真实 IP
-    /http_code=\$\(curl -s -o \/dev\/null -w "%\{http_code\}" --connect-timeout "\$timeout" "\$url"/ {
-        gsub(/curl -s -o/, "curl $CurlARG -s -o")
-    }
-    # 3. get_ipv4 遵循 -6 (IPV4check=0) 跳过探测，避免多余请求与 IPv4 泄露
-    /^get_ipv4\(\)\{$/ { in_get4 = 1 }
-    in_get4 && /^IPV4=""$/ {
-        print
-        print "[[ $IPV4check -eq 0 ]] && { IPV4work=0; return 0; }"
-        in_get4 = 0
-        next
-    }
-    # 4. get_ipv6 遵循 -4 (IPV6check=0) 跳过探测，避免多余请求与 IPv6 泄露
-    /^get_ipv6\(\)\{$/ { in_get6 = 1 }
-    in_get6 && /^IPV6=""$/ {
-        print
-        print "[[ $IPV6check -eq 0 ]] && { IPV6work=0; return 0; }"
-        in_get6 = 0
-        next
-    }
-    # 5. 修复 macOS/BSD sed 下 hide_ipv6 正则 \+ 不兼容问题
-    /sed \x27s\/::\\\+\/:\/g\x27/ {
-        gsub(/sed \x27s\/::\\\+\/:\/g\x27/, "sed \x27s/::\\{1,\\}/:/g\x27")
-    }
-    # 6. db_ipinfo 拉取 iso3166.json 与 show_ad 走 $CurlARG，避免旁路请求
-    /ISO3166=\$\(curl -sL -m 10 "\$\{rawgithub\}main\/ref\/iso3166\.json"\)/ {
-        gsub(/curl -sL/, "curl $CurlARG -sL")
-    }
-    /content=\$\(curl -fsL --max-time 5 "\$\{rawgithub\}main\/ref\/ad\$i\.ans"\)/ {
-        gsub(/curl -fsL/, "curl $CurlARG -fsL")
-    }
-    /aad\[0\]=\$\(curl -sL --max-time 5 "\$\{rawgithub\}main\/ref\/sponsor\.ans"\)/ {
-        gsub(/curl -sL/, "curl $CurlARG -sL")
-    }
-    # 7. 支持通过 0600 临时配置文件传递代理 (-K)，防止 ps aux 进程表泄露代理账号密码
-    /^usePROXY=" -x \$xproxy"$/ {
-        print "if [[ -n \"${IPZHILIANG_CURL_CFG:-}\" && -f \"${IPZHILIANG_CURL_CFG:-}\" ]]; then usePROXY=\" -K ${IPZHILIANG_CURL_CFG}\"; else usePROXY=\" -x $xproxy\"; fi"
-        next
-    }
-    # 8. get_opts 结尾：仅在未指定 -i / -x 时才按已解析的 -4/-6 探测默认出口 IP
-    /^\[\[ \$IPV4check -eq 1 && \$IPV6check -eq 0 && \$IPV4work -eq 0 \]\]&&ERRORcode=40$/ {
-        print "if [[ -z $useNIC && -z $usePROXY ]]; then get_ipv4; get_ipv6; is_valid_ipv4 $IPV4; is_valid_ipv6 $IPV6; fi"
-    }
-    # 9. 报告上传控制：隐私模式物理级阻断 upload.check.place；公开模式走 $CurlARG
-    /https:\/\/upload\.check\.place/ {
-        if (privacy_no_upload == "1") {
-            print "report_link=\"\""
-            next
-        } else {
-            gsub(/curl -\$2 -s -X POST https:\/\/upload\.check\.place/, "curl $CurlARG -$2 -s -X POST https://upload.check.place")
-        }
-    }
-    # 10. 启动阶段先执行 get_opts 解析 -x/-i/-4/-6，绝不在解析参数前裸连探测宿主机默认 IP
-    /^check_connectivity$/ {
-        skip_pre_init = 1
-        next
-    }
-    skip_pre_init && /^(read_ref|get_ipv4|get_ipv6|is_valid_ipv4 \$IPV4|is_valid_ipv6 \$IPV6)$/ {
-        next
-    }
-    skip_pre_init && /^get_opts "\$@"$/ {
-        print "get_opts \"$@\""
-        print "[[ $ERRORcode -eq 0 ]] && check_connectivity"
-        print "[[ $ERRORcode -eq 0 ]] && read_ref"
-        skip_pre_init = 0
-        next
-    }
-    # 11. 禁用 clear 清屏，防止抹除配置总览及多端口批量检测时的前序报告
-    /^clear$/ {
-        print ": # clear disabled"
-        next
-    }
-    { print }
-    ' "$script_file" > "$patched_file" 2>/dev/null || true
+# 通用拉取工具：根据模式严格通过代理或指定网卡请求（IPv6 直连若目标 API 无 AAAA 则自动兼容）
+fetch_db_json() {
+    local url="$1"
+    local stack="$2"
+    local out_file="$3"
+    local resp=""
 
-    if [[ -s "$patched_file" ]] && "$BASH4_BIN" -n "$patched_file" 2>/dev/null; then
-        chmod 600 "$patched_file" 2>/dev/null || true
-        mv -f "$patched_file" "$script_file"
+    if [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]]; then
+        resp=$(curl -K "$ACTIVE_CURL_CFG" -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" "$url" 2>/dev/null || true)
+    elif [[ -n "$ACTIVE_IFACE" ]]; then
+        if is_ipv6_literal "$ACTIVE_IFACE"; then
+            resp=$(curl --interface "$ACTIVE_IFACE" -6 -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" "$url" 2>/dev/null || true)
+        elif is_ipv4_literal "$ACTIVE_IFACE"; then
+            resp=$(curl --interface "$ACTIVE_IFACE" -4 -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" "$url" 2>/dev/null || true)
+        else
+            resp=$(curl --interface "$ACTIVE_IFACE" -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" "$url" 2>/dev/null || true)
+        fi
     else
-        rm -f "$patched_file"
+        resp=$(curl -fsL --connect-timeout 4 --max-time 8 -A "$UA_CHROME" "$url" 2>/dev/null || true)
+    fi
+
+    if [[ -n "$resp" ]] && echo "$resp" | jq -e . >/dev/null 2>&1; then
+        printf '%s' "$resp" > "$out_file"
+    else
+        printf '{}' > "$out_file"
     fi
 }
 
-download_upstream_script() {
-    TMP_SCRIPT=$(make_temp_file "ipzhiliang")
-    local ts
-    ts=$(date +%s)
-    echo -e "${C_DIM}正在实时拉取最新 IP 质量检测引擎与数据库...${C_RESET}"
-    if curl -fsL --connect-timeout 8 --max-time 25 -H "Cache-Control: no-cache" -H "Pragma: no-cache" "$UPSTREAM_PRIMARY" -o "$TMP_SCRIPT" 2>/dev/null && [[ -s "$TMP_SCRIPT" ]] && grep -q "script_version=" "$TMP_SCRIPT" 2>/dev/null; then
-        local up_ver
-        up_ver=$(grep -m1 '^script_version=' "$TMP_SCRIPT" | cut -d'"' -f2)
-        patch_upstream_script "$TMP_SCRIPT"
-        [[ -n "$up_ver" ]] && echo -e "${C_GREEN}[已同步] 上游检测引擎版本: ${up_ver} (IP.Check.Place 实时最新 · 已启用隐私加固)${C_RESET}"
-        return 0
+fetch_scamalytics_data() {
+    local ip="$1"
+    local out_file="$2"
+    local html=""
+
+    if [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]]; then
+        html=$(curl -K "$ACTIVE_CURL_CFG" -fsL --connect-timeout 4 --max-time 9 -A "$UA_CHROME" "https://scamalytics.com/ip/${ip}" 2>/dev/null || true)
+    elif [[ -n "$ACTIVE_IFACE" ]]; then
+        html=$(curl --interface "$ACTIVE_IFACE" -fsL --connect-timeout 4 --max-time 9 -A "$UA_CHROME" "https://scamalytics.com/ip/${ip}" 2>/dev/null || true)
+    else
+        html=$(curl -fsL --connect-timeout 4 --max-time 9 -A "$UA_CHROME" "https://scamalytics.com/ip/${ip}" 2>/dev/null || true)
     fi
-    echo -e "${C_YELLOW}主源下载超时，正在切换至 GitHub 备用源...${C_RESET}"
-    if curl -fsL --connect-timeout 10 --max-time 30 -H "Cache-Control: no-cache" "${UPSTREAM_FALLBACK}?t=${ts}" -o "$TMP_SCRIPT" 2>/dev/null && [[ -s "$TMP_SCRIPT" ]] && grep -q "script_version=" "$TMP_SCRIPT" 2>/dev/null; then
-        local up_ver
-        up_ver=$(grep -m1 '^script_version=' "$TMP_SCRIPT" | cut -d'"' -f2)
-        patch_upstream_script "$TMP_SCRIPT"
-        [[ -n "$up_ver" ]] && echo -e "${C_GREEN}[已同步] 上游检测引擎版本: ${up_ver} (GitHub 备用源 · 已启用隐私加固)${C_RESET}"
-        return 0
+
+    if [[ -z "$html" ]]; then
+        printf '{}' > "$out_file"
+        return
     fi
-    echo -e "${C_RED}[错误] 无法下载上游检测脚本，请检查网络连接。${C_RESET}"
-    exit 1
+
+    local score risk cc vpn tor server proxy robot
+    score=$(echo "$html" | grep -oE '"score":"[0-9]+"' | head -n1 | grep -oE '[0-9]+' || true)
+    risk=$(echo "$html" | grep -oE '"risk":"[^"]+"' | head -n1 | cut -d'"' -f4 || true)
+
+    local parsed
+    parsed=$(echo "$html" | awk '
+        /<th>/ { h = $0 }
+        /<td>/ {
+            row = h " => " $0
+            gsub(/<[^>]*>/, " ", row)
+            gsub(/[[:space:]]+/, " ", row)
+            print row
+        }
+    ')
+
+    cc=$(echo "$parsed" | awk -F'=>' '/Country Code/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')
+    vpn=$(echo "$parsed" | awk -F'=>' '/Anonymizing VPN/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit}')
+    tor=$(echo "$parsed" | awk -F'=>' '/Tor Exit Node/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit}')
+    server=$(echo "$parsed" | awk -F'=>' '/ Server / {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit}')
+    proxy=$(echo "$parsed" | awk -F'=>' '/Public Proxy|Web Proxy|Residential Proxy/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if (tolower($2)=="yes") {print "yes"; exit}} END{}')
+    if [[ -z "$proxy" ]] && echo "$parsed" | grep -q "Public Proxy"; then
+        proxy="no"
+    fi
+    robot=$(echo "$parsed" | awk -F'=>' '/Search Engine Robot/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit}')
+
+    [[ "$vpn" == "yes" ]] && vpn="true" || { [[ "$vpn" == "no" ]] && vpn="false" || vpn="null"; }
+    [[ "$tor" == "yes" ]] && tor="true" || { [[ "$tor" == "no" ]] && tor="false" || tor="null"; }
+    [[ "$server" == "yes" ]] && server="true" || { [[ "$server" == "no" ]] && server="false" || server="null"; }
+    [[ "$proxy" == "yes" ]] && proxy="true" || { [[ "$proxy" == "no" ]] && proxy="false" || proxy="null"; }
+    [[ "$robot" == "yes" ]] && robot="true" || { [[ "$robot" == "no" ]] && robot="false" || robot="null"; }
+
+    jq -n \
+        --arg score "${score:-}" \
+        --arg risk "${risk:-}" \
+        --arg cc "${cc:-}" \
+        --arg vpn "$vpn" \
+        --arg tor "$tor" \
+        --arg server "$server" \
+        --arg proxy "$proxy" \
+        --arg robot "$robot" \
+        '{score: $score, risk: $risk, country: $cc, vpn: $vpn, tor: $tor, server: $server, proxy: $proxy, robot: $robot}' > "$out_file"
 }
 
-# 多端口导出时为每个端口生成独立文件名，避免上游 -o 报文件已存在
+fetch_optional_byok() {
+    local ip="$1"
+    local workdir="$2"
+
+    # 可选 AbuseIPDB（通过 stdin header 传递 API Key，防 ps aux 泄露）
+    if [[ -n "${ABUSEIPDB_API_KEY:-}" ]]; then
+        local resp=""
+        local -a extra=()
+        [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]] && extra+=("-K" "$ACTIVE_CURL_CFG")
+        [[ -z "$ACTIVE_CURL_CFG" && -n "$ACTIVE_IFACE" ]] && extra+=("--interface" "$ACTIVE_IFACE")
+        resp=$(printf 'header = "Key: %s"\nheader = "Accept: application/json"\n' "$ABUSEIPDB_API_KEY" | \
+            curl -K - ${extra[@]+"${extra[@]}"} -fsL --connect-timeout 4 --max-time 8 \
+            "https://api.abuseipdb.com/api/v2/check?ipAddress=${ip}&maxAgeInDays=90" 2>/dev/null || true)
+        if [[ -n "$resp" ]] && echo "$resp" | jq -e '.data' >/dev/null 2>&1; then
+            printf '%s' "$resp" > "${workdir}/db_abuseipdb.json"
+        fi
+    fi
+
+    # 可选 IPQualityScore（通过 curl -K - 传递 URL，防 API Key 暴露在 ps aux）
+    if [[ -n "${IPQS_API_KEY:-}" ]]; then
+        local resp=""
+        local -a extra=()
+        [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]] && extra+=("-K" "$ACTIVE_CURL_CFG")
+        [[ -z "$ACTIVE_CURL_CFG" && -n "$ACTIVE_IFACE" ]] && extra+=("--interface" "$ACTIVE_IFACE")
+        resp=$(printf 'url = "https://www.ipqualityscore.com/api/json/ip/%s/%s?strictness=1"\n' "$IPQS_API_KEY" "$ip" | \
+            curl -K - ${extra[@]+"${extra[@]}"} -fsL --connect-timeout 4 --max-time 8 2>/dev/null || true)
+        if [[ -n "$resp" ]] && echo "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
+            printf '%s' "$resp" > "${workdir}/db_ipqs.json"
+        fi
+    fi
+}
+
+# ==============================================================================
+# 独立自研核心检测引擎：Phase 2 AI 与流媒体并行探测
+# ==============================================================================
+
+is_openai_blocked_cc() {
+    case "$1" in
+        CN|HK|MO|RU|BY|KP|IR|SY|CU|AF|VE) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_claude_blocked_cc() {
+    case "$1" in
+        CN|HK|MO|RU|BY|KP|IR|SY|CU) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+probe_media_chatgpt() {
+    local stack="$1" out="$2"
+    local trace cc api_code web_code status="failed"
+    trace=$(curl_exec_stack "$stack" -fsL --connect-timeout 5 --max-time 10 -A "$UA_CHROME" "https://chatgpt.com/cdn-cgi/trace" 2>/dev/null || true)
+    cc=$(echo "$trace" | awk -F= '/^loc=/{print $2; exit}' | tr -d '[:space:]')
+    api_code=$(curl_exec_stack "$stack" -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "https://api.openai.com/v1/models" 2>/dev/null || echo "000")
+    web_code=$(curl_exec_stack "$stack" -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 -A "$UA_CHROME" "https://ios.chat.openai.com/" 2>/dev/null || echo "000")
+
+    if [[ -n "$cc" ]] && is_openai_blocked_cc "$cc"; then
+        status="blocked"
+    elif [[ "$api_code" == "401" || "$api_code" == "200" ]]; then
+        if [[ "$web_code" == "403" ]]; then
+            status="api_only"
+        else
+            status="yes"
+        fi
+    elif [[ "$api_code" == "403" || "$api_code" == "451" ]]; then
+        status="blocked"
+    else
+        status="failed"
+    fi
+    printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
+}
+
+probe_media_claude() {
+    local stack="$1" out="$2"
+    local trace cc api_code status="failed"
+    trace=$(curl_exec_stack "$stack" -fsL --connect-timeout 5 --max-time 10 -A "$UA_CHROME" "https://claude.ai/cdn-cgi/trace" 2>/dev/null || true)
+    cc=$(echo "$trace" | awk -F= '/^loc=/{print $2; exit}' | tr -d '[:space:]')
+    api_code=$(curl_exec_stack "$stack" -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "https://api.anthropic.com/v1/messages" 2>/dev/null || echo "000")
+
+    if [[ -n "$cc" ]] && is_claude_blocked_cc "$cc"; then
+        status="blocked"
+    elif [[ "$api_code" == "401" || "$api_code" == "405" || "$api_code" == "400" || "$api_code" == "200" ]]; then
+        status="yes"
+    elif [[ "$api_code" == "403" || "$api_code" == "451" ]]; then
+        status="blocked"
+    else
+        status="failed"
+    fi
+    printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
+}
+
+probe_media_gemini() {
+    local stack="$1" out="$2"
+    local html status="failed" cc=""
+    html=$(curl_exec_stack "$stack" -fsL --connect-timeout 6 --max-time 12 -A "$UA_CHROME" -H "Accept-Language: en-US,en;q=0.9" "https://gemini.google.com" 2>/dev/null || true)
+    if [[ -n "$html" ]]; then
+        cc=$(grep -oE '2,1,200,"[A-Z]{3}"' <<< "$html" 2>/dev/null | head -n1 | grep -oE '[A-Z]{3}' || true)
+        if grep -q '45631641' <<< "$html" 2>/dev/null; then
+            status="yes"
+        else
+            status="blocked"
+        fi
+    fi
+    printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
+}
+
+probe_media_netflix() {
+    local stack="$1" out="$2"
+    local c1 c2 loc cc="" status="failed"
+    c1=$(curl_exec_stack "$stack" -s -o /dev/null -w "%{http_code}" --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.netflix.com/title/81280792" 2>/dev/null || echo "000")
+    if [[ "$c1" == "200" ]]; then
+        status="yes"
+        loc=$(curl_exec_stack "$stack" -sI --connect-timeout 5 --max-time 10 -A "$UA_CHROME" "https://www.netflix.com/title/80018499" 2>/dev/null | grep -i '^location:' | head -n1 || true)
+        cc=$(echo "$loc" | sed -nE 's/.*netflix\.com\/([a-zA-Z]{2})([-\/]|$).*/\1/p' | tr '[:lower:]' '[:upper:]')
+        [[ -z "$cc" ]] && cc="US"
+    elif [[ "$c1" == "404" || "$c1" == "403" ]]; then
+        c2=$(curl_exec_stack "$stack" -s -o /dev/null -w "%{http_code}" --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.netflix.com/title/80018499" 2>/dev/null || echo "000")
+        if [[ "$c2" == "200" ]]; then
+            status="originals"
+            loc=$(curl_exec_stack "$stack" -sI --connect-timeout 5 --max-time 10 -A "$UA_CHROME" "https://www.netflix.com/title/80018499" 2>/dev/null | grep -i '^location:' | head -n1 || true)
+            cc=$(echo "$loc" | sed -nE 's/.*netflix\.com\/([a-zA-Z]{2})([-\/]|$).*/\1/p' | tr '[:lower:]' '[:upper:]')
+            [[ -z "$cc" ]] && cc="US"
+        elif [[ "$c2" == "403" ]]; then
+            status="blocked"
+        else
+            status="failed"
+        fi
+    else
+        status="failed"
+    fi
+    printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
+}
+
+probe_media_disney() {
+    local stack="$1" out="$2"
+    local hdrs code loc cc="" status="failed"
+    hdrs=$(curl_exec_stack "$stack" -sI --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.disneyplus.com/" 2>/dev/null || true)
+    code=$(echo "$hdrs" | awk 'NR==1{print $2}')
+    loc=$(echo "$hdrs" | grep -i '^location:' | head -n1 | tr -d '\r')
+
+    if [[ -z "$code" ]]; then
+        status="failed"
+    elif echo "$loc" | grep -qi "unavailable"; then
+        status="blocked"
+    elif [[ "$code" == "403" || "$code" == "451" ]]; then
+        status="blocked"
+    elif [[ "$code" == "200" || "$code" == "301" || "$code" == "302" ]]; then
+        status="yes"
+        cc=$(echo "$loc" | sed -nE 's/.*disneyplus\.com\/[a-z]{2}-([a-z]{2}).*/\1/p' | tr '[:lower:]' '[:upper:]')
+        [[ -z "$cc" ]] && cc="US"
+    fi
+    printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
+}
+
+probe_media_youtube() {
+    local stack="$1" out="$2"
+    local html cc="" status="failed"
+    html=$(curl_exec_stack "$stack" -fsL --compressed --connect-timeout 6 --max-time 12 -A "$UA_CHROME" -H "Accept-Language: en" "https://www.youtube.com/premium" 2>/dev/null || true)
+    if [[ -n "$html" ]]; then
+        cc=$(grep -oE '"countryCode":"[A-Z]{2}"' <<< "$html" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+        if grep -qi "is not available in your country" <<< "$html" 2>/dev/null; then
+            status="no_prem"
+        elif [[ -n "$cc" ]] || grep -qi "YouTube Premium" <<< "$html" 2>/dev/null; then
+            status="yes"
+            [[ -z "$cc" ]] && cc="US"
+        else
+            status="blocked"
+        fi
+    fi
+    printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
+}
+
+probe_media_tiktok() {
+    local stack="$1" out="$2"
+    local html cc="" status="failed"
+    html=$(curl_exec_stack "$stack" -fsL --compressed --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.tiktok.com/" 2>/dev/null || true)
+    if [[ -n "$html" ]]; then
+        cc=$(grep -oE '"region":"[A-Z]{2}"' <<< "$html" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+        if [[ -n "$cc" ]]; then
+            status="yes"
+        else
+            status="blocked"
+        fi
+    fi
+    printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
+}
+
+probe_media_prime() {
+    local stack="$1" out="$2"
+    local html cc="" status="failed"
+    html=$(curl_exec_stack "$stack" -fsL --compressed --connect-timeout 6 --max-time 12 -A "$UA_CHROME" "https://www.primevideo.com/" 2>/dev/null || true)
+    if [[ -n "$html" ]]; then
+        cc=$(grep -oE '"currentTerritory":"[A-Z]{2}"' <<< "$html" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+        if [[ "$cc" == "CN" ]]; then
+            status="blocked"
+        elif [[ -n "$cc" ]]; then
+            status="yes"
+        else
+            status="blocked"
+        fi
+    fi
+    printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
+}
+
+probe_media_reddit() {
+    local stack="$1" out="$2"
+    local resp code body cc="" status="failed"
+    resp=$(curl_exec_stack "$stack" -sL --compressed --connect-timeout 6 --max-time 12 \
+        -A "$UA_CHROME" \
+        -H "Referer: https://www.reddit.com/" \
+        -H "Origin: https://www.reddit.com" \
+        --write-out '\n%{http_code}' \
+        "https://www.reddit.com/svc/shreddit/reddit-chat" 2>/dev/null || true)
+    code=$(printf '%s' "$resp" | tail -n1 | tr -d '[:space:]')
+    body=$(printf '%s' "$resp" | sed '$d')
+    case "$code" in
+        200)
+            status="yes"
+            cc=$(grep -oE 'country="[A-Z]{2}"' <<< "$body" 2>/dev/null | head -n1 | cut -d'"' -f2 || true)
+            ;;
+        403|451)
+            status="blocked"
+            ;;
+        *)
+            status="failed"
+            ;;
+    esac
+    printf '%s|%s\n' "$status" "${cc:-N/A}" > "$out"
+}
+
+# ==============================================================================
+# 独立自研核心检测引擎：Phase 3 邮局 25 端口 & DNSBL 并行扫描
+# ==============================================================================
+
+load_dnsbl_list() {
+    local script_dir=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)
+    fi
+    if [[ -n "$script_dir" && -r "${script_dir}/dnsbl.list" ]]; then
+        grep -vE '^[[:space:]]*(#|$)' "${script_dir}/dnsbl.list"
+    else
+        printf '%s\n' "${EMBEDDED_DNSBL_LIST[@]}"
+    fi
+}
+
+# 并行 DNSBL 扫描：代理模式下强制走 DoH 经由代理查询，彻底防止本机 DNS 泄露
+scan_dnsbl() {
+    local ip="$1"
+    local out_summary="$2"
+    local out_hits="$3"
+    local rev_ip
+    rev_ip=$(echo "$ip" | awk -F. '{print $4"."$3"."$2"."$1}')
+
+    local dnsbl_dir="${TMP_WORKDIR}/dnsbl_jobs"
+    mkdir -p "$dnsbl_dir"
+    rm -f "$dnsbl_dir"/* 2>/dev/null || true
+
+    local use_doh=0
+    if [[ -n "$ACTIVE_CURL_CFG" && -f "$ACTIVE_CURL_CFG" ]]; then
+        use_doh=1
+    elif ! command -v dig >/dev/null 2>&1; then
+        use_doh=1
+    fi
+
+    local -a zones=()
+    local z
+    while IFS= read -r z; do
+        [[ -n "$z" ]] && zones+=("$z")
+    done < <(load_dnsbl_list)
+
+    # 非代理且本机有 dig 时附带 Spamhaus ZEN（自动过滤 127.255.255.* 公共解析器提示码）
+    if [[ $use_doh -eq 0 ]]; then
+        zones=("zen.spamhaus.org" "${zones[@]}")
+    fi
+
+    local idx=0
+    for z in "${zones[@]}"; do
+        idx=$((idx + 1))
+        (
+            local ans=""
+            if [[ $use_doh -eq 1 ]]; then
+                ans=$(curl_exec -fsL --connect-timeout 3 --max-time 5 \
+                    -H "Accept: application/dns-json" \
+                    "https://dns.google/resolve?name=${rev_ip}.${z}&type=A" 2>/dev/null | \
+                    jq -r '.Answer[0].data // ""' 2>/dev/null || true)
+            else
+                ans=$(dig +short +time=2 +tries=1 "${rev_ip}.${z}" A 2>/dev/null | head -n1 || true)
+            fi
+
+            if [[ -z "$ans" || "$ans" == 127.255.255.* || ! "$ans" =~ ^127\. ]]; then
+                echo "CLEAN" > "${dnsbl_dir}/${idx}.res"
+            else
+                echo "HIT|${z}|${ans}" > "${dnsbl_dir}/${idx}.res"
+            fi
+        ) &
+    done
+    wait
+
+    local total=0 clean=0 hits=0
+    : > "$out_hits"
+    local f line
+    for f in "${dnsbl_dir}"/*.res; do
+        [[ -f "$f" ]] || continue
+        total=$((total + 1))
+        line=$(cat "$f")
+        if [[ "$line" == HIT\|* ]]; then
+            hits=$((hits + 1))
+            echo "${line#HIT|}" >> "$out_hits"
+        else
+            clean=$((clean + 1))
+        fi
+    done
+
+    local mode_tag="dig"
+    [[ $use_doh -eq 1 ]] && mode_tag="DoH"
+    printf '%d|%d|%d|%s\n' "$total" "$clean" "$hits" "$mode_tag" > "$out_summary"
+}
+
+# 邮局 25 端口连通性检测（代理模式下严格跳过直连，防止绕过代理泄露本机 IP）
+scan_mail_port25() {
+    local ip="$1"
+    local out_file="$2"
+
+    if [[ "$TARGET_MODE" == "port" ]]; then
+        printf 'proxy_skip|0||\n' > "$out_file"
+        return 0
+    fi
+    if [[ "$SKIP_MAIL" -eq 1 ]]; then
+        printf 'user_skip|0||\n' > "$out_file"
+        return 0
+    fi
+
+    local local_status="blocked"
+    if command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -qE ':25([[:space:]]|$)'; then
+        local_status="occupied"
+    elif command -v netstat >/dev/null 2>&1 && netstat -tln 2>/dev/null | grep -qE '[:.]25([[:space:]]|$)'; then
+        local_status="occupied"
+    fi
+
+    if ! command -v nc >/dev/null 2>&1; then
+        printf 'no_nc|0||\n' > "$out_file"
+        return 0
+    fi
+
+    # 测试本地出站 25 端口连通性（仅非占用时）
+    local nc_bind_opt=""
+    if is_ipv4_literal "$ip"; then
+        # 检查该 IP 是否确实属于本机网卡（避免 NAT VPS 内网场景下 nc -s 公网IP 报错）
+        if (command -v ip >/dev/null 2>&1 && ip addr show 2>/dev/null | grep -qw "$ip") || \
+           (command -v ifconfig >/dev/null 2>&1 && ifconfig 2>/dev/null | grep -qw "$ip"); then
+            nc_bind_opt="-s $ip"
+        fi
+    fi
+
+    local resp=""
+    if [[ "$local_status" != "occupied" ]]; then
+        resp=$(run_with_timeout 5 sh -c "printf 'QUIT\r\n' | nc ${nc_bind_opt} -w 3 smtp.mailgun.org 25 2>&1" || true)
+        if [[ "$resp" == *"220"* ]]; then
+            local_status="available"
+        fi
+    fi
+
+    # 并发探测主流邮局 MX 25 端口（仅当本地出站 25 端口可用或需验证时，耗时 <4s）
+    local mail_dir="${TMP_WORKDIR}/mail_jobs"
+    mkdir -p "$mail_dir"
+    rm -f "$mail_dir"/* 2>/dev/null || true
+
+    local providers=("Gmail:gmail.com" "Outlook:outlook.com" "Yahoo:yahoo.com" "Apple:me.com" "QQ:qq.com" "163:163.com")
+    local entry name dom
+    if command -v dig >/dev/null 2>&1; then
+        for entry in "${providers[@]}"; do
+            name="${entry%%:*}"
+            dom="${entry#*:}"
+            (
+                local mx r ok=0
+                mx=$(dig +short +time=2 +tries=1 MX "$dom" 2>/dev/null | sort -n | head -n1 | awk '{print $2}')
+                if [[ -n "$mx" ]]; then
+                    r=$(run_with_timeout 4 sh -c "printf 'QUIT\r\n' | nc ${nc_bind_opt} -w 3 ${mx} 25 2>&1" || true)
+                    [[ "$r" == *"220"* ]] && ok=1
+                fi
+                echo "${name}:${ok}" > "${mail_dir}/${name}.res"
+            ) &
+        done
+        wait
+    fi
+
+    local ok_list="" fail_list="" ok_cnt=0 f line pname pok
+    for entry in "${providers[@]}"; do
+        name="${entry%%:*}"
+        f="${mail_dir}/${name}.res"
+        if [[ -f "$f" ]]; then
+            line=$(cat "$f")
+            pname="${line%%:*}"
+            pok="${line#*:}"
+            if [[ "$pok" == "1" ]]; then
+                ok_cnt=$((ok_cnt + 1))
+                ok_list="${ok_list}${ok_list:+,}${pname}"
+            else
+                fail_list="${fail_list}${fail_list:+,}${pname}"
+            fi
+        fi
+    done
+
+    printf '%s|%d|%s|%s\n' "$local_status" "$ok_cnt" "$ok_list" "$fail_list" > "$out_file"
+}
+
+# ==============================================================================
+# 渲染辅助函数（评分条、标签、综合纯净度评级）
+# ==============================================================================
+
+render_risk_bar() {
+    local score="$1"
+    local filled=$(( score * 20 / 100 ))
+    (( filled > 20 )) && filled=20
+    (( filled < 0 )) && filled=0
+    local empty=$(( 20 - filled ))
+
+    local bar_color="$C_GREEN"
+    local label=""
+    if (( score < 20 )); then
+        bar_color="$C_GREEN"
+        [[ "$LANG_CODE" == "en" ]] && label="Very Low" || label="极低风险"
+    elif (( score < 40 )); then
+        bar_color="$C_GREEN"
+        [[ "$LANG_CODE" == "en" ]] && label="Low" || label="低风险"
+    elif (( score < 65 )); then
+        bar_color="$C_YELLOW"
+        [[ "$LANG_CODE" == "en" ]] && label="Medium" || label="中风险"
+    elif (( score < 85 )); then
+        bar_color="$C_RED"
+        [[ "$LANG_CODE" == "en" ]] && label="High" || label="高风险"
+    else
+        bar_color="$C_RED"
+        [[ "$LANG_CODE" == "en" ]] && label="Very High" || label="极高风险"
+    fi
+
+    local bar_fill="" bar_empty="" i
+    for (( i=0; i<filled; i++ )); do bar_fill+="#"; done
+    for (( i=0; i<empty; i++ )); do bar_empty+="-"; done
+
+    printf "%b[%s%s]%b %3d/100 (%b%s%b)" "$bar_color" "$bar_fill" "$bar_empty" "$C_RESET" "$score" "$bar_color$C_BOLD" "$label" "$C_RESET"
+}
+
+# 每个布尔单元格严格占用 9 个显示列宽，确保中英文表格绝对对齐
+render_bool_cell() {
+    local val="$1"
+    case "$val" in
+        true|yes|1)
+            if [[ "$LANG_CODE" == "en" ]]; then
+                printf "${C_RED}${C_BOLD}Yes      ${C_RESET}"
+            else
+                printf "${C_RED}${C_BOLD}是       ${C_RESET}"
+            fi
+            ;;
+        false|no|0)
+            if [[ "$LANG_CODE" == "en" ]]; then
+                printf "${C_GREEN}No       ${C_RESET}"
+            else
+                printf "${C_GREEN}否       ${C_RESET}"
+            fi
+            ;;
+        *)
+            printf "${C_DIM}N/A      ${C_RESET}"
+            ;;
+    esac
+}
+
+render_type_badge() {
+    local raw="$1"
+    local low
+    low=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
+    case "$low" in
+        isp|residential|"fixed line isp")
+            [[ "$LANG_CODE" == "en" ]] && echo -e "${BG_GREEN}${C_WHITE}${C_BOLD} Residential/ISP ${C_RESET}" || echo -e "${BG_GREEN}${C_WHITE}${C_BOLD} 家宽/ISP ${C_RESET}"
+            ;;
+        mobile|wireless)
+            [[ "$LANG_CODE" == "en" ]] && echo -e "${BG_GREEN}${C_WHITE}${C_BOLD} Mobile/Wireless ${C_RESET}" || echo -e "${BG_GREEN}${C_WHITE}${C_BOLD} 移动/无线 ${C_RESET}"
+            ;;
+        business|commercial)
+            [[ "$LANG_CODE" == "en" ]] && echo -e "${BG_YELLOW}${C_WHITE}${C_BOLD} Business ${C_RESET}" || echo -e "${BG_YELLOW}${C_WHITE}${C_BOLD} 商业/企业 ${C_RESET}"
+            ;;
+        hosting|datacenter|vpn|socks*|proxy|compromised)
+            [[ "$LANG_CODE" == "en" ]] && echo -e "${BG_RED}${C_WHITE}${C_BOLD} ${raw} ${C_RESET}" || echo -e "${BG_RED}${C_WHITE}${C_BOLD} 机房/${raw} ${C_RESET}"
+            ;;
+        education)
+            [[ "$LANG_CODE" == "en" ]] && echo -e "${BG_BLUE}${C_WHITE}${C_BOLD} Education ${C_RESET}" || echo -e "${BG_BLUE}${C_WHITE}${C_BOLD} 教育网 ${C_RESET}"
+            ;;
+        ""|null|unknown)
+            echo -e "${C_DIM}N/A${C_RESET}"
+            ;;
+        *)
+            echo -e "${C_YELLOW}${raw}${C_RESET}"
+            ;;
+    esac
+}
+
+# 渲染单列定宽流媒体/AI 状态（按可见字符宽度补齐空格，避免 ANSI 转义符与中文宽字符破坏对齐）
+render_media_cell() {
+    local status="$1"
+    local region="$2"
+    local target_width="${3:-22}"
+    local reg_str=""
+    [[ -n "$region" && "$region" != "N/A" ]] && reg_str=" [${region}]"
+
+    local colored="" vis_len=0
+    local reg_len=${#reg_str}
+    case "$status" in
+        yes)
+            if [[ "$LANG_CODE" == "en" ]]; then
+                colored="${C_GREEN}${C_BOLD}Unlocked${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
+                vis_len=$((8 + reg_len))
+            else
+                colored="${C_GREEN}${C_BOLD}解锁${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
+                vis_len=$((4 + reg_len))
+            fi
+            ;;
+        originals)
+            if [[ "$LANG_CODE" == "en" ]]; then
+                colored="${C_YELLOW}${C_BOLD}Originals${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
+                vis_len=$((9 + reg_len))
+            else
+                colored="${C_YELLOW}${C_BOLD}仅自制剧${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
+                vis_len=$((8 + reg_len))
+            fi
+            ;;
+        api_only)
+            if [[ "$LANG_CODE" == "en" ]]; then
+                colored="${C_YELLOW}${C_BOLD}API Only${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
+                vis_len=$((8 + reg_len))
+            else
+                colored="${C_YELLOW}${C_BOLD}仅API可用${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
+                vis_len=$((9 + reg_len))
+            fi
+            ;;
+        no_prem)
+            if [[ "$LANG_CODE" == "en" ]]; then
+                colored="${C_YELLOW}${C_BOLD}No Premium${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
+                vis_len=$((10 + reg_len))
+            else
+                colored="${C_YELLOW}${C_BOLD}禁会员${C_RESET}${C_CYAN}${reg_str}${C_RESET}"
+                vis_len=$((6 + reg_len))
+            fi
+            ;;
+        blocked)
+            if [[ "$LANG_CODE" == "en" ]]; then
+                colored="${C_RED}${C_BOLD}Blocked${C_RESET}${C_DIM}${reg_str}${C_RESET}"
+                vis_len=$((7 + reg_len))
+            else
+                colored="${C_RED}${C_BOLD}屏蔽/受限${C_RESET}${C_DIM}${reg_str}${C_RESET}"
+                vis_len=$((9 + reg_len))
+            fi
+            ;;
+        *)
+            if [[ "$LANG_CODE" == "en" ]]; then
+                colored="${C_DIM}Failed${C_RESET}"
+                vis_len=6
+            else
+                colored="${C_DIM}检测失败${C_RESET}"
+                vis_len=8
+            fi
+            ;;
+    esac
+
+    local pad=$((target_width - vis_len))
+    (( pad < 1 )) && pad=1
+    local spaces=""
+    spaces=$(printf '%*s' "$pad" "")
+    printf "%b%s" "$colored" "$spaces"
+}
+
+# ==============================================================================
+# 单 IP 完整体检流程（3 阶段并发执行）
+# ==============================================================================
+
+run_single_ip_check() {
+    local ip="$1"
+    local stack="$2"
+    local out_path="$3"
+    local display_ip
+    display_ip=$(format_ip_display "$ip")
+
+    local run_dir="${TMP_WORKDIR}/run_${stack}_${RANDOM}"
+    mkdir -p "$run_dir"
+
+    # ---------------- Phase 1: 并行查询 6 大独立 IP 情报库 ----------------
+    echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(1/3) 正在并行查询多源 IP 情报与风控数据库...${C_RESET}" >&2
+    fetch_db_json "https://ipinfo.io/widget/demo/${ip}" "$stack" "${run_dir}/db_ipinfo.json" &
+    fetch_db_json "https://api.ipquery.io/${ip}" "$stack" "${run_dir}/db_ipquery.json" &
+    fetch_db_json "https://proxycheck.io/v2/${ip}?vpn=1&asn=1&risk=1" "$stack" "${run_dir}/db_proxycheck.json" &
+    fetch_db_json "http://ip-api.com/json/${ip}?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,mobile,proxy,hosting" "$stack" "${run_dir}/db_ipapi.json" &
+    fetch_db_json "https://api.ip2location.io/?ip=${ip}" "$stack" "${run_dir}/db_ip2loc.json" &
+    fetch_scamalytics_data "$ip" "${run_dir}/db_scam.json" &
+    fetch_optional_byok "$ip" "$run_dir" &
+    wait
+    echo -ne "\r\033[2K" >&2
+
+    # ---------------- Phase 2: 并行检测 9 大 AI 与流媒体平台 ----------------
+    if [[ "$SKIP_MEDIA" -eq 0 ]]; then
+        echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(2/3) 正在并行检测 AI (ChatGPT/Claude/Gemini) 与流媒体解锁...${C_RESET}" >&2
+        probe_media_chatgpt "$stack" "${run_dir}/m_chatgpt.txt" &
+        probe_media_claude "$stack" "${run_dir}/m_claude.txt" &
+        probe_media_gemini "$stack" "${run_dir}/m_gemini.txt" &
+        probe_media_netflix "$stack" "${run_dir}/m_netflix.txt" &
+        probe_media_disney "$stack" "${run_dir}/m_disney.txt" &
+        probe_media_youtube "$stack" "${run_dir}/m_youtube.txt" &
+        probe_media_tiktok "$stack" "${run_dir}/m_tiktok.txt" &
+        probe_media_prime "$stack" "${run_dir}/m_prime.txt" &
+        probe_media_reddit "$stack" "${run_dir}/m_reddit.txt" &
+        wait
+        echo -ne "\r\033[2K" >&2
+    fi
+
+    # ---------------- Phase 3: 并行扫描 DNSBL 黑名单 + 25 端口 ----------------
+    echo -ne "${C_CYAN}[${display_ip}]${C_RESET} ${C_DIM}(3/3) 正在并行扫描 DNSBL 黑名单与邮局 25 端口...${C_RESET}" >&2
+    if [[ "$stack" == "4" ]]; then
+        scan_dnsbl "$ip" "${run_dir}/dnsbl_summary.txt" "${run_dir}/dnsbl_hits.txt" &
+    fi
+    scan_mail_port25 "$ip" "${run_dir}/mail_summary.txt" &
+    wait
+    echo -ne "\r\033[2K" >&2
+
+    # ---------------- 聚合解析各数据源字段 ----------------
+    local f_ipinfo="${run_dir}/db_ipinfo.json"
+    local f_ipquery="${run_dir}/db_ipquery.json"
+    local f_pcheck="${run_dir}/db_proxycheck.json"
+    local f_ipapi="${run_dir}/db_ipapi.json"
+    local f_ip2loc="${run_dir}/db_ip2loc.json"
+    local f_scam="${run_dir}/db_scam.json"
+
+    # 基础信息（多源智能回退，保证即使单源限流也完整可用）
+    local asn org isp rdns country_code country_name region_name city_name timezone reg_country is_anycast
+    asn=$(jq -r '.data.asn.asn // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$asn" ]] && asn=$(jq -r '.isp.asn // empty' "$f_ipquery" 2>/dev/null)
+    [[ -z "$asn" ]] && asn=$(jq -r --arg ip "$ip" '.[$ip].asn // empty' "$f_pcheck" 2>/dev/null)
+    [[ -z "$asn" ]] && asn=$(jq -r '.asn // empty' "$f_ip2loc" 2>/dev/null | sed 's/^\([0-9]\)/AS\1/')
+
+    org=$(jq -r '.data.asn.name // .data.company.name // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$org" ]] && org=$(jq -r '.isp.org // .isp.isp // empty' "$f_ipquery" 2>/dev/null)
+    [[ -z "$org" ]] && org=$(jq -r --arg ip "$ip" '.[$ip].organisation // .[$ip].provider // empty' "$f_pcheck" 2>/dev/null)
+    [[ -z "$org" ]] && org=$(jq -r '.org // .isp // empty' "$f_ipapi" 2>/dev/null)
+
+    isp=$(jq -r '.isp.isp // empty' "$f_ipquery" 2>/dev/null)
+    [[ -z "$isp" ]] && isp=$(jq -r --arg ip "$ip" '.[$ip].provider // empty' "$f_pcheck" 2>/dev/null)
+    [[ -z "$isp" ]] && isp="$org"
+
+    rdns=$(jq -r '.data.hostname // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$rdns" ]] && rdns=$(jq -r --arg ip "$ip" '.[$ip].hostname // empty' "$f_pcheck" 2>/dev/null)
+
+    country_code=$(jq -r '.data.country // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$country_code" ]] && country_code=$(jq -r '.location.country_code // empty' "$f_ipquery" 2>/dev/null)
+    [[ -z "$country_code" ]] && country_code=$(jq -r --arg ip "$ip" '.[$ip].isocode // empty' "$f_pcheck" 2>/dev/null)
+    [[ -z "$country_code" ]] && country_code=$(jq -r '.countryCode // empty' "$f_ipapi" 2>/dev/null)
+
+    country_name=$(jq -r '.location.country // empty' "$f_ipquery" 2>/dev/null)
+    [[ -z "$country_name" ]] && country_name=$(jq -r --arg ip "$ip" '.[$ip].country // empty' "$f_pcheck" 2>/dev/null)
+    [[ -z "$country_name" ]] && country_name=$(jq -r '.country // empty' "$f_ipapi" 2>/dev/null)
+    [[ -z "$country_name" ]] && country_name=$(jq -r '.country_name // empty' "$f_ip2loc" 2>/dev/null)
+
+    region_name=$(jq -r '.data.region // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$region_name" ]] && region_name=$(jq -r '.location.state // empty' "$f_ipquery" 2>/dev/null)
+    [[ -z "$region_name" ]] && region_name=$(jq -r '.regionName // empty' "$f_ipapi" 2>/dev/null)
+
+    city_name=$(jq -r '.data.city // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$city_name" ]] && city_name=$(jq -r '.location.city // empty' "$f_ipquery" 2>/dev/null)
+    [[ -z "$city_name" ]] && city_name=$(jq -r '.city // empty' "$f_ipapi" 2>/dev/null)
+
+    timezone=$(jq -r '.data.timezone // empty' "$f_ipinfo" 2>/dev/null)
+    [[ -z "$timezone" ]] && timezone=$(jq -r '.location.timezone // empty' "$f_ipquery" 2>/dev/null)
+    [[ -z "$timezone" ]] && timezone=$(jq -r '.timezone // empty' "$f_ipapi" 2>/dev/null)
+
+    reg_country=$(jq -r '.data.abuse.country // empty' "$f_ipinfo" 2>/dev/null)
+    is_anycast=$(jq -r '.data.is_anycast // false' "$f_ipinfo" 2>/dev/null)
+
+    # 类型字段
+    local t_ipinfo_use t_ipinfo_com t_pcheck
+    t_ipinfo_use=$(jq -r '.data.asn.type // ""' "$f_ipinfo" 2>/dev/null)
+    t_ipinfo_com=$(jq -r '.data.company.type // ""' "$f_ipinfo" 2>/dev/null)
+    t_pcheck=$(jq -r --arg ip "$ip" '.[$ip].type // ""' "$f_pcheck" 2>/dev/null)
+
+    # 各库风险分
+    local s_scam s_pcheck s_ipquery s_abuse="" s_ipqs=""
+    s_scam=$(jq -r '.score // ""' "$f_scam" 2>/dev/null)
+    s_pcheck=$(jq -r --arg ip "$ip" '.[$ip].risk // ""' "$f_pcheck" 2>/dev/null)
+    s_ipquery=$(jq -r '.risk.risk_score // ""' "$f_ipquery" 2>/dev/null)
+    [[ -f "${run_dir}/db_abuseipdb.json" ]] && s_abuse=$(jq -r '.data.abuseConfidenceScore // ""' "${run_dir}/db_abuseipdb.json" 2>/dev/null)
+    [[ -f "${run_dir}/db_ipqs.json" ]] && s_ipqs=$(jq -r '.fraud_score // ""' "${run_dir}/db_ipqs.json" 2>/dev/null)
+
+    # 风险因子矩阵（6 个独立源）
+    local cc_ii cc_iq cc_pc cc_sc cc_ia cc_i2
+    cc_ii=$(jq -r '.data.country // "N/A"' "$f_ipinfo" 2>/dev/null)
+    cc_iq=$(jq -r '.location.country_code // "N/A"' "$f_ipquery" 2>/dev/null)
+    cc_pc=$(jq -r --arg ip "$ip" '.[$ip].isocode // "N/A"' "$f_pcheck" 2>/dev/null)
+    cc_sc=$(jq -r '.country // "N/A"' "$f_scam" 2>/dev/null); [[ -z "$cc_sc" ]] && cc_sc="N/A"
+    cc_ia=$(jq -r '.countryCode // "N/A"' "$f_ipapi" 2>/dev/null)
+    cc_i2=$(jq -r '.country_code // "N/A"' "$f_ip2loc" 2>/dev/null)
+
+    local px_ii px_iq px_pc px_sc px_ia px_i2
+    px_ii=$(jq -r 'if .data.privacy.proxy == null then "null" else (.data.privacy.proxy|tostring) end' "$f_ipinfo" 2>/dev/null)
+    px_iq=$(jq -r 'if .risk.is_proxy == null then "null" else (.risk.is_proxy|tostring) end' "$f_ipquery" 2>/dev/null)
+    px_pc=$(jq -r --arg ip "$ip" '.[$ip].proxy // "null"' "$f_pcheck" 2>/dev/null)
+    px_sc=$(jq -r '.proxy // "null"' "$f_scam" 2>/dev/null)
+    px_ia=$(jq -r 'if .proxy == null then "null" else (.proxy|tostring) end' "$f_ipapi" 2>/dev/null)
+    px_i2=$(jq -r 'if .is_proxy == null then "null" else (.is_proxy|tostring) end' "$f_ip2loc" 2>/dev/null)
+
+    local vpn_ii vpn_iq vpn_pc vpn_sc
+    vpn_ii=$(jq -r 'if .data.privacy.vpn == null then "null" else (.data.privacy.vpn|tostring) end' "$f_ipinfo" 2>/dev/null)
+    vpn_iq=$(jq -r 'if .risk.is_vpn == null then "null" else (.risk.is_vpn|tostring) end' "$f_ipquery" 2>/dev/null)
+    vpn_pc="null"; [[ "$(echo "$t_pcheck" | tr '[:upper:]' '[:lower:]')" == "vpn" ]] && vpn_pc="true" || { [[ -n "$t_pcheck" ]] && vpn_pc="false"; }
+    vpn_sc=$(jq -r '.vpn // "null"' "$f_scam" 2>/dev/null)
+
+    local tor_ii tor_iq tor_sc
+    tor_ii=$(jq -r 'if .data.privacy.tor == null then "null" else (.data.privacy.tor|tostring) end' "$f_ipinfo" 2>/dev/null)
+    tor_iq=$(jq -r 'if .risk.is_tor == null then "null" else (.risk.is_tor|tostring) end' "$f_ipquery" 2>/dev/null)
+    tor_sc=$(jq -r '.tor // "null"' "$f_scam" 2>/dev/null)
+
+    local srv_ii srv_iq srv_pc srv_sc srv_ia
+    srv_ii=$(jq -r 'if .data.privacy.hosting == null then "null" else (.data.privacy.hosting|tostring) end' "$f_ipinfo" 2>/dev/null)
+    srv_iq=$(jq -r 'if .risk.is_datacenter == null then "null" else (.risk.is_datacenter|tostring) end' "$f_ipquery" 2>/dev/null)
+    srv_pc="null"; [[ "$(echo "$t_pcheck" | tr '[:upper:]' '[:lower:]')" == *"hosting"* ]] && srv_pc="true" || { [[ -n "$t_pcheck" ]] && srv_pc="false"; }
+    srv_sc=$(jq -r '.server // "null"' "$f_scam" 2>/dev/null)
+    srv_ia=$(jq -r 'if .hosting == null then "null" else (.hosting|tostring) end' "$f_ipapi" 2>/dev/null)
+
+    local mob_ii mob_iq mob_ia rob_sc
+    mob_ii=$(jq -r 'if .data.is_mobile == null then "null" else (.data.is_mobile|tostring) end' "$f_ipinfo" 2>/dev/null)
+    mob_iq=$(jq -r 'if .risk.is_mobile == null then "null" else (.risk.is_mobile|tostring) end' "$f_ipquery" 2>/dev/null)
+    mob_ia=$(jq -r 'if .mobile == null then "null" else (.mobile|tostring) end' "$f_ipapi" 2>/dev/null)
+    rob_sc=$(jq -r '.robot // "null"' "$f_scam" 2>/dev/null)
+
+    # DNSBL 结果
+    local dnsbl_total=0 dnsbl_clean=0 dnsbl_hits=0 dnsbl_mode="N/A" dnsbl_hit_names=""
+    if [[ "$stack" == "4" && -f "${run_dir}/dnsbl_summary.txt" ]]; then
+        IFS='|' read -r dnsbl_total dnsbl_clean dnsbl_hits dnsbl_mode < "${run_dir}/dnsbl_summary.txt"
+        if [[ -s "${run_dir}/dnsbl_hits.txt" ]]; then
+            dnsbl_hit_names=$(awk -F'|' '{print $1}' "${run_dir}/dnsbl_hits.txt" | tr '\n' ',' | sed 's/,$//')
+        fi
+    fi
+
+    # 邮局 25 端口结果
+    local mail_local="skipped" mail_ok_cnt=0 mail_ok_list="" mail_fail_list=""
+    if [[ -f "${run_dir}/mail_summary.txt" ]]; then
+        IFS='|' read -r mail_local mail_ok_cnt mail_ok_list mail_fail_list < "${run_dir}/mail_summary.txt"
+    fi
+
+    # 计算综合风险分（加权平均可用风险源 + DNSBL 命中惩罚）
+    local score_sum=0 score_cnt=0 sc
+    for sc in "$s_scam" "$s_pcheck" "$s_ipquery" "$s_abuse" "$s_ipqs"; do
+        if [[ "$sc" =~ ^[0-9]+$ ]]; then
+            score_sum=$((score_sum + sc))
+            score_cnt=$((score_cnt + 1))
+        fi
+    done
+    local avg_score=0
+    if (( score_cnt > 0 )); then
+        avg_score=$((score_sum / score_cnt))
+    fi
+    if (( dnsbl_hits > 0 )); then
+        avg_score=$((avg_score + dnsbl_hits * 15))
+        (( avg_score > 100 )) && avg_score=100
+    fi
+
+    # 原生 vs 广播判定
+    local geo_type_code="unknown" geo_type_label=""
+    if [[ -n "$country_code" && -n "$reg_country" ]]; then
+        if [[ "$country_code" == "$reg_country" ]]; then
+            geo_type_code="native"
+            [[ "$LANG_CODE" == "en" ]] && geo_type_label="${BG_GREEN}${C_WHITE}${C_BOLD} Native IP ${C_RESET}" || geo_type_label="${BG_GREEN}${C_WHITE}${C_BOLD} 原生 IP ${C_RESET}"
+        else
+            geo_type_code="broadcast"
+            [[ "$LANG_CODE" == "en" ]] && geo_type_label="${BG_YELLOW}${C_WHITE}${C_BOLD} Broadcast IP ${C_RESET}" || geo_type_label="${BG_YELLOW}${C_WHITE}${C_BOLD} 广播 IP ${C_RESET}"
+        fi
+    fi
+
+    # 读取流媒体/AI 结果
+    local m_chatgpt_s="" m_chatgpt_r="" m_claude_s="" m_claude_r="" m_gemini_s="" m_gemini_r=""
+    local m_netflix_s="" m_netflix_r="" m_disney_s="" m_disney_r="" m_youtube_s="" m_youtube_r=""
+    local m_tiktok_s="" m_tiktok_r="" m_prime_s="" m_prime_r="" m_reddit_s="" m_reddit_r=""
+    if [[ "$SKIP_MEDIA" -eq 0 ]]; then
+        [[ -f "${run_dir}/m_chatgpt.txt" ]] && IFS='|' read -r m_chatgpt_s m_chatgpt_r < "${run_dir}/m_chatgpt.txt"
+        [[ -f "${run_dir}/m_claude.txt" ]]  && IFS='|' read -r m_claude_s m_claude_r < "${run_dir}/m_claude.txt"
+        [[ -f "${run_dir}/m_gemini.txt" ]]  && IFS='|' read -r m_gemini_s m_gemini_r < "${run_dir}/m_gemini.txt"
+        [[ -f "${run_dir}/m_netflix.txt" ]] && IFS='|' read -r m_netflix_s m_netflix_r < "${run_dir}/m_netflix.txt"
+        [[ -f "${run_dir}/m_disney.txt" ]]  && IFS='|' read -r m_disney_s m_disney_r < "${run_dir}/m_disney.txt"
+        [[ -f "${run_dir}/m_youtube.txt" ]] && IFS='|' read -r m_youtube_s m_youtube_r < "${run_dir}/m_youtube.txt"
+        [[ -f "${run_dir}/m_tiktok.txt" ]]  && IFS='|' read -r m_tiktok_s m_tiktok_r < "${run_dir}/m_tiktok.txt"
+        [[ -f "${run_dir}/m_prime.txt" ]]   && IFS='|' read -r m_prime_s m_prime_r < "${run_dir}/m_prime.txt"
+        [[ -f "${run_dir}/m_reddit.txt" ]]  && IFS='|' read -r m_reddit_s m_reddit_r < "${run_dir}/m_reddit.txt"
+    fi
+
+    local now_time
+    if [[ "$LANG_CODE" == "en" ]]; then
+        now_time=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+    else
+        now_time=$(TZ="Asia/Shanghai" date +"%Y-%m-%d %H:%M:%S CST" 2>/dev/null || date +"%Y-%m-%d %H:%M:%S")
+    fi
+
+    # ---------------- 构建结构化 JSON ----------------
+    local report_json
+    report_json=$(jq -n \
+        --arg ver "v${VERSION}" \
+        --arg time "$now_time" \
+        --arg ip "$display_ip" \
+        --arg stack "IPv${stack}" \
+        --arg mode "$TARGET_MODE" \
+        --arg asn "${asn:-N/A}" \
+        --arg org "${org:-N/A}" \
+        --arg isp "${isp:-N/A}" \
+        --arg rdns "${rdns:-}" \
+        --arg cc "${country_code:-N/A}" \
+        --arg cname "${country_name:-N/A}" \
+        --arg regcc "${reg_country:-N/A}" \
+        --arg region "${region_name:-}" \
+        --arg city "${city_name:-}" \
+        --arg tz "${timezone:-N/A}" \
+        --arg geotype "$geo_type_code" \
+        --arg t_ii_u "${t_ipinfo_use:-N/A}" \
+        --arg t_ii_c "${t_ipinfo_com:-N/A}" \
+        --arg t_pc "${t_pcheck:-N/A}" \
+        --arg s_scam "${s_scam:-}" \
+        --arg s_pc "${s_pcheck:-}" \
+        --arg s_iq "${s_ipquery:-}" \
+        --arg s_ab "${s_abuse:-}" \
+        --arg s_ipqs "${s_ipqs:-}" \
+        --argjson avg "$avg_score" \
+        --arg px_ii "$px_ii" --arg px_iq "$px_iq" --arg px_pc "$px_pc" --arg px_sc "$px_sc" --arg px_ia "$px_ia" --arg px_i2 "$px_i2" \
+        --arg vpn_ii "$vpn_ii" --arg vpn_iq "$vpn_iq" --arg vpn_pc "$vpn_pc" --arg vpn_sc "$vpn_sc" \
+        --arg tor_ii "$tor_ii" --arg tor_iq "$tor_iq" --arg tor_sc "$tor_sc" \
+        --arg srv_ii "$srv_ii" --arg srv_iq "$srv_iq" --arg srv_pc "$srv_pc" --arg srv_sc "$srv_sc" --arg srv_ia "$srv_ia" \
+        --arg mob_ii "$mob_ii" --arg mob_iq "$mob_iq" --arg mob_ia "$mob_ia" \
+        --arg rob_sc "$rob_sc" \
+        --arg cg_s "$m_chatgpt_s" --arg cg_r "$m_chatgpt_r" \
+        --arg cl_s "$m_claude_s" --arg cl_r "$m_claude_r" \
+        --arg gm_s "$m_gemini_s" --arg gm_r "$m_gemini_r" \
+        --arg nf_s "$m_netflix_s" --arg nf_r "$m_netflix_r" \
+        --arg ds_s "$m_disney_s" --arg ds_r "$m_disney_r" \
+        --arg yt_s "$m_youtube_s" --arg yt_r "$m_youtube_r" \
+        --arg tt_s "$m_tiktok_s" --arg tt_r "$m_tiktok_r" \
+        --arg pv_s "$m_prime_s" --arg pv_r "$m_prime_r" \
+        --arg rd_s "$m_reddit_s" --arg rd_r "$m_reddit_r" \
+        --arg mail_loc "$mail_local" --arg mail_ok "$mail_ok_list" --arg mail_fail "$mail_fail_list" \
+        --argjson d_tot "$dnsbl_total" --argjson d_cln "$dnsbl_clean" --argjson d_hit "$dnsbl_hits" --arg d_mode "$dnsbl_mode" --arg d_names "$dnsbl_hit_names" \
+        '{
+            meta: {tool: "IPzhiliang", version: $ver, time: $time, ip: $ip, stack: $stack, mode: $mode, privacy_upload: false},
+            basic: {asn: $asn, organization: $org, isp: $isp, rdns: $rdns, country_code: $cc, country: $cname, registered_country: $regcc, region: $region, city: $city, timezone: $tz, ip_origin: $geotype},
+            type: {ipinfo_usage: $t_ii_u, ipinfo_company: $t_ii_c, proxycheck: $t_pc},
+            risk_score: {composite: $avg, scamalytics: $s_scam, proxycheck: $s_pc, ipquery: $s_iq, abuseipdb: $s_ab, ipqs: $s_ipqs},
+            risk_factors: {
+                proxy: {ipinfo: $px_ii, ipquery: $px_iq, proxycheck: $px_pc, scamalytics: $px_sc, ipapi: $px_ia, ip2location: $px_i2},
+                vpn: {ipinfo: $vpn_ii, ipquery: $vpn_iq, proxycheck: $vpn_pc, scamalytics: $vpn_sc},
+                tor: {ipinfo: $tor_ii, ipquery: $tor_iq, scamalytics: $tor_sc},
+                server: {ipinfo: $srv_ii, ipquery: $srv_iq, proxycheck: $srv_pc, scamalytics: $srv_sc, ipapi: $srv_ia},
+                mobile: {ipinfo: $mob_ii, ipquery: $mob_iq, ipapi: $mob_ia},
+                robot: {scamalytics: $rob_sc}
+            },
+            unlock: {
+                ChatGPT: {status: $cg_s, region: $cg_r},
+                Claude: {status: $cl_s, region: $cl_r},
+                Gemini: {status: $gm_s, region: $gm_r},
+                Netflix: {status: $nf_s, region: $nf_r},
+                DisneyPlus: {status: $ds_s, region: $ds_r},
+                YouTube: {status: $yt_s, region: $yt_r},
+                TikTok: {status: $tt_s, region: $tt_r},
+                PrimeVideo: {status: $pv_s, region: $pv_r},
+                Reddit: {status: $rd_s, region: $rd_r}
+            },
+            mail: {port25_outbound: $mail_loc, reachable_providers: $mail_ok, blocked_providers: $mail_fail},
+            dnsbl: {method: $d_mode, total: $d_tot, clean: $d_cln, blacklisted: $d_hit, hits: $d_names}
+        }')
+
+    # ---------------- 构建终端彩色报告 ----------------
+    local report_ansi_file="${run_dir}/report.ansi"
+    {
+        local sep="========================================================================"
+        local dash="------------------------------------------------------------------------"
+        echo -e "${C_CYAN}${C_BOLD}${sep}${C_RESET}"
+        if [[ "$LANG_CODE" == "en" ]]; then
+            echo -e "  ${C_BOLD}IPzhiliang IP Quality Report (IPv${stack})${C_RESET}   Target: ${C_CYAN}${C_BOLD}${display_ip}${C_RESET}"
+            echo -e "  ${C_DIM}Time: ${now_time}  |  v${VERSION}  |  Standalone · Local Zero-Upload${C_RESET}"
+        else
+            echo -e "  ${C_BOLD}IPzhiliang IP 质量体检报告 (IPv${stack})${C_RESET}      目标 IP: ${C_CYAN}${C_BOLD}${display_ip}${C_RESET}"
+            echo -e "  ${C_DIM}报告时间: ${now_time}  |  v${VERSION}  |  独立引擎 · 纯本地零上传${C_RESET}"
+        fi
+        if [[ -n "$ACTIVE_PROXY_DISPLAY" ]]; then
+            echo -e "  ${C_DIM}检测通道: 代理 ${ACTIVE_PROXY_DISPLAY}${C_RESET}"
+        elif [[ -n "$ACTIVE_IFACE" ]]; then
+            echo -e "  ${C_DIM}检测通道: 出口 $(format_iface_display "$ACTIVE_IFACE")${C_RESET}"
+        fi
+        echo -e "${C_CYAN}${C_BOLD}${sep}${C_RESET}"
+
+        # 一、基础信息
+        if [[ "$LANG_CODE" == "en" ]]; then
+            echo -e "${C_BOLD}${C_BLUE}[1] Basic Information${C_RESET}"
+            printf "  %-20s %b\n" "ASN:" "${C_GREEN}${asn:-N/A}${C_RESET}"
+            printf "  %-20s %b\n" "Organization:" "${C_GREEN}${org:-N/A}${C_RESET}"
+            [[ -n "$rdns" ]] && printf "  %-20s %b\n" "rDNS Hostname:" "${C_CYAN}${rdns}${C_RESET}"
+            printf "  %-20s %b\n" "Actual Region:" "${C_GREEN}[${country_code:-N/A}] ${country_name:-N/A}${C_RESET}"
+            [[ -n "$city_name" || -n "$region_name" ]] && printf "  %-20s %b\n" "Location:" "${C_GREEN}${region_name:+${region_name}, }${city_name}${C_RESET}"
+            [[ -n "$reg_country" ]] && printf "  %-20s %b\n" "Registered Region:" "${C_GREEN}[${reg_country}]${C_RESET}"
+            [[ -n "$geo_type_label" ]] && printf "  %-20s %b\n" "IP Origin Type:" "${geo_type_label}"
+            printf "  %-20s %b\n" "Time Zone:" "${C_GREEN}${timezone:-N/A}${C_RESET}"
+            [[ "$is_anycast" == "true" ]] && printf "  %-20s %b\n" "Network Flag:" "${C_YELLOW}Anycast${C_RESET}"
+        else
+            echo -e "${C_BOLD}${C_BLUE}一、基础信息（多源融合校验）${C_RESET}"
+            echo -e "  ${C_CYAN}自治系统号 (ASN):${C_RESET}   ${C_GREEN}${asn:-N/A}${C_RESET}"
+            echo -e "  ${C_CYAN}所属组织 / 运营商:${C_RESET}  ${C_GREEN}${org:-N/A}${C_RESET}"
+            [[ -n "$rdns" ]] && echo -e "  ${C_CYAN}反向解析 (rDNS):${C_RESET}    ${C_CYAN}${rdns}${C_RESET}"
+            echo -e "  ${C_CYAN}实际使用地区:${C_RESET}       ${C_GREEN}[${country_code:-N/A}] ${country_name:-N/A}${C_RESET}"
+            [[ -n "$city_name" || -n "$region_name" ]] && echo -e "  ${C_CYAN}省州 / 城市:${C_RESET}        ${C_GREEN}${region_name:+${region_name}, }${city_name}${C_RESET}"
+            [[ -n "$reg_country" ]] && echo -e "  ${C_CYAN}注册归属地区:${C_RESET}       ${C_GREEN}[${reg_country}]${C_RESET}"
+            [[ -n "$geo_type_label" ]] && echo -e "  ${C_CYAN}IP 归属性质:${C_RESET}        ${geo_type_label}"
+            echo -e "  ${C_CYAN}所在时区:${C_RESET}           ${C_GREEN}${timezone:-N/A}${C_RESET}"
+            [[ "$is_anycast" == "true" ]] && echo -e "  ${C_CYAN}网络广播特性:${C_RESET}       ${C_YELLOW}Anycast (任播网络)${C_RESET}"
+        fi
+        echo -e "${C_DIM}${dash}${C_RESET}"
+
+        # 二、IP 类型与风控评分
+        if [[ "$LANG_CODE" == "en" ]]; then
+            echo -e "${C_BOLD}${C_BLUE}[2] IP Type & Risk Scores${C_RESET}"
+            echo -e "  Usage Type (IPinfo):    $(render_type_badge "$t_ipinfo_use")   Company: $(render_type_badge "$t_ipinfo_com")"
+            echo -e "  Type (ProxyCheck):      $(render_type_badge "$t_pcheck")"
+            echo -e "  ${C_BOLD}Composite Score:${C_RESET}        $(render_risk_bar "$avg_score")"
+        else
+            echo -e "${C_BOLD}${C_BLUE}二、IP 类型与多库风控评分${C_RESET}"
+            echo -e "  ${C_CYAN}IPinfo 使用类型:${C_RESET}    $(render_type_badge "$t_ipinfo_use")   ${C_CYAN}公司类型:${C_RESET} $(render_type_badge "$t_ipinfo_com")"
+            echo -e "  ${C_CYAN}ProxyCheck 分类:${C_RESET}    $(render_type_badge "$t_pcheck")"
+            echo -e "  ${C_CYAN}${C_BOLD}综合风控评级:${C_RESET}       $(render_risk_bar "$avg_score")"
+        fi
+        [[ "$s_scam" =~ ^[0-9]+$ ]]    && printf "    %-18s %b\n" "Scamalytics:" "$(render_risk_bar "$s_scam")"
+        [[ "$s_pcheck" =~ ^[0-9]+$ ]]  && printf "    %-18s %b\n" "ProxyCheck:" "$(render_risk_bar "$s_pcheck")"
+        [[ "$s_ipquery" =~ ^[0-9]+$ ]] && printf "    %-18s %b\n" "IPQuery:" "$(render_risk_bar "$s_ipquery")"
+        [[ "$s_abuse" =~ ^[0-9]+$ ]]   && printf "    %-18s %b\n" "AbuseIPDB(Key):" "$(render_risk_bar "$s_abuse")"
+        [[ "$s_ipqs" =~ ^[0-9]+$ ]]    && printf "    %-18s %b\n" "IPQS(Key):" "$(render_risk_bar "$s_ipqs")"
+        echo -e "${C_DIM}${dash}${C_RESET}"
+
+        # 三、风险因子矩阵（定宽 9 列精确对齐）
+        if [[ "$LANG_CODE" == "en" ]]; then
+            echo -e "${C_BOLD}${C_BLUE}[3] Risk Factors Cross-Check${C_RESET}"
+            printf "  ${C_CYAN}%-10s${C_RESET}%-9s%-9s%-9s%-9s%-9s%-9s\n" "Factor" "IPinfo" "IPQuery" "ProxyChk" "Scamalyt" "IP-API" "IP2Loc"
+            printf "  %-10s${C_GREEN}%-9s%-9s%-9s%-9s%-9s%-9s${C_RESET}\n" "Region" "$cc_ii" "$cc_iq" "$cc_pc" "$cc_sc" "$cc_ia" "$cc_i2"
+            printf "  %-10s%b%b%b%b%b%b\n" "Proxy"  "$(render_bool_cell "$px_ii")"  "$(render_bool_cell "$px_iq")"  "$(render_bool_cell "$px_pc")"  "$(render_bool_cell "$px_sc")"  "$(render_bool_cell "$px_ia")"  "$(render_bool_cell "$px_i2")"
+            printf "  %-10s%b%b%b%b%b%b\n" "VPN"    "$(render_bool_cell "$vpn_ii")" "$(render_bool_cell "$vpn_iq")" "$(render_bool_cell "$vpn_pc")" "$(render_bool_cell "$vpn_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
+            printf "  %-10s%b%b%b%b%b%b\n" "Tor"    "$(render_bool_cell "$tor_ii")" "$(render_bool_cell "$tor_iq")" "$(render_bool_cell "null")"    "$(render_bool_cell "$tor_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
+            printf "  %-10s%b%b%b%b%b%b\n" "Server" "$(render_bool_cell "$srv_ii")" "$(render_bool_cell "$srv_iq")" "$(render_bool_cell "$srv_pc")" "$(render_bool_cell "$srv_sc")" "$(render_bool_cell "$srv_ia")" "$(render_bool_cell "null")"
+            printf "  %-10s%b%b%b%b%b%b\n" "Mobile" "$(render_bool_cell "$mob_ii")" "$(render_bool_cell "$mob_iq")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "$mob_ia")" "$(render_bool_cell "null")"
+            printf "  %-10s%b%b%b%b%b%b\n" "Robot"  "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "$rob_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
+        else
+            echo -e "${C_BOLD}${C_BLUE}三、六源风险因子交叉矩阵${C_RESET}"
+            printf "  ${C_CYAN}风控项    ${C_RESET}%-9s%-9s%-9s%-9s%-9s%-9s\n" "IPinfo" "IPQuery" "ProxyChk" "Scamalyt" "IP-API" "IP2Loc"
+            printf "  地区码    ${C_GREEN}%-9s%-9s%-9s%-9s%-9s%-9s${C_RESET}\n" "$cc_ii" "$cc_iq" "$cc_pc" "$cc_sc" "$cc_ia" "$cc_i2"
+            printf "  代理      %b%b%b%b%b%b\n" "$(render_bool_cell "$px_ii")"  "$(render_bool_cell "$px_iq")"  "$(render_bool_cell "$px_pc")"  "$(render_bool_cell "$px_sc")"  "$(render_bool_cell "$px_ia")"  "$(render_bool_cell "$px_i2")"
+            printf "  VPN       %b%b%b%b%b%b\n" "$(render_bool_cell "$vpn_ii")" "$(render_bool_cell "$vpn_iq")" "$(render_bool_cell "$vpn_pc")" "$(render_bool_cell "$vpn_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
+            printf "  Tor       %b%b%b%b%b%b\n" "$(render_bool_cell "$tor_ii")" "$(render_bool_cell "$tor_iq")" "$(render_bool_cell "null")"    "$(render_bool_cell "$tor_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
+            printf "  机房      %b%b%b%b%b%b\n" "$(render_bool_cell "$srv_ii")" "$(render_bool_cell "$srv_iq")" "$(render_bool_cell "$srv_pc")" "$(render_bool_cell "$srv_sc")" "$(render_bool_cell "$srv_ia")" "$(render_bool_cell "null")"
+            printf "  移动      %b%b%b%b%b%b\n" "$(render_bool_cell "$mob_ii")" "$(render_bool_cell "$mob_iq")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "$mob_ia")" "$(render_bool_cell "null")"
+            printf "  爬虫      %b%b%b%b%b%b\n" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "null")"    "$(render_bool_cell "$rob_sc")" "$(render_bool_cell "null")"    "$(render_bool_cell "null")"
+        fi
+        echo -e "${C_DIM}${dash}${C_RESET}"
+
+        # 四、AI 与流媒体解锁
+        if [[ "$SKIP_MEDIA" -eq 0 ]]; then
+            if [[ "$LANG_CODE" == "en" ]]; then
+                echo -e "${C_BOLD}${C_BLUE}[4] AI & Streaming Unlock${C_RESET}"
+            else
+                echo -e "${C_BOLD}${C_BLUE}四、AI 与流媒体解锁检测${C_RESET}"
+            fi
+            printf "  ${C_CYAN}%-13s${C_RESET}%b${C_CYAN}%-13s${C_RESET}%b\n" "ChatGPT:" "$(render_media_cell "$m_chatgpt_s" "$m_chatgpt_r" 24)" "Claude:"     "$(render_media_cell "$m_claude_s" "$m_claude_r" 1)"
+            printf "  ${C_CYAN}%-13s${C_RESET}%b${C_CYAN}%-13s${C_RESET}%b\n" "Gemini:"  "$(render_media_cell "$m_gemini_s" "$m_gemini_r" 24)"   "Netflix:"    "$(render_media_cell "$m_netflix_s" "$m_netflix_r" 1)"
+            printf "  ${C_CYAN}%-13s${C_RESET}%b${C_CYAN}%-13s${C_RESET}%b\n" "Disney+:" "$(render_media_cell "$m_disney_s" "$m_disney_r" 24)"   "YouTube:"    "$(render_media_cell "$m_youtube_s" "$m_youtube_r" 1)"
+            printf "  ${C_CYAN}%-13s${C_RESET}%b${C_CYAN}%-13s${C_RESET}%b\n" "TikTok:"  "$(render_media_cell "$m_tiktok_s" "$m_tiktok_r" 24)"   "PrimeVideo:" "$(render_media_cell "$m_prime_s" "$m_prime_r" 1)"
+            printf "  ${C_CYAN}%-13s${C_RESET}%b\n"                           "Reddit:"  "$(render_media_cell "$m_reddit_s" "$m_reddit_r" 1)"
+            echo -e "${C_DIM}${dash}${C_RESET}"
+        fi
+
+        # 五、邮局 25 端口与 DNSBL 黑名单
+        if [[ "$LANG_CODE" == "en" ]]; then
+            echo -e "${C_BOLD}${C_BLUE}[5] Mail Port 25 & DNSBL Blacklist${C_RESET}"
+            case "$mail_local" in
+                available)  echo -e "  Port 25 Outbound: ${C_GREEN}${C_BOLD}Available${C_RESET} ${mail_ok_list:+(Reachable: ${mail_ok_list})}" ;;
+                occupied)   echo -e "  Port 25 Outbound: ${C_YELLOW}Local Port 25 Occupied${C_RESET} ${mail_ok_list:+(Reachable: ${mail_ok_list})}" ;;
+                proxy_skip) echo -e "  Port 25 Outbound: ${C_DIM}Skipped in proxy mode (prevents direct host IP leak)${C_RESET}" ;;
+                user_skip)  echo -e "  Port 25 Outbound: ${C_DIM}Skipped (--no-mail)${C_RESET}" ;;
+                no_nc)      echo -e "  Port 25 Outbound: ${C_DIM}Skipped (nc not installed)${C_RESET}" ;;
+                *)          echo -e "  Port 25 Outbound: ${C_RED}Blocked${C_RESET} ${mail_ok_list:+(Remote reachable: ${mail_ok_list})}" ;;
+            esac
+            if [[ "$stack" == "4" ]]; then
+                echo -e "  DNSBL (${dnsbl_mode}):     Total ${C_CYAN}${dnsbl_total}${C_RESET}  |  Clean ${C_GREEN}${dnsbl_clean}${C_RESET}  |  Blacklisted $([[ $dnsbl_hits -gt 0 ]] && echo -e "${C_RED}${C_BOLD}${dnsbl_hits}${C_RESET}" || echo -e "${C_GREEN}0${C_RESET}")"
+                [[ -n "$dnsbl_hit_names" ]] && echo -e "  ${C_RED}Blacklisted By:${C_RESET}   ${dnsbl_hit_names}"
+            else
+                echo -e "  DNSBL Blacklist:  ${C_DIM}IPv4 only (skipped for IPv6)${C_RESET}"
+            fi
+        else
+            echo -e "${C_BOLD}${C_BLUE}五、邮局 25 端口与 DNSBL 黑名单扫描${C_RESET}"
+            case "$mail_local" in
+                available)  echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_GREEN}${C_BOLD}可用${C_RESET} ${mail_ok_list:+(可达邮局: ${mail_ok_list})}" ;;
+                occupied)   echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_YELLOW}已被本地占用${C_RESET} ${mail_ok_list:+(可达邮局: ${mail_ok_list})}" ;;
+                proxy_skip) echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_DIM}代理模式下自动跳过（防止直连绕过代理泄露本机 IP）${C_RESET}" ;;
+                user_skip)  echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_DIM}已跳过 (--no-mail)${C_RESET}" ;;
+                no_nc)      echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_DIM}未检测到 nc，已跳过${C_RESET}" ;;
+                *)          echo -e "  ${C_CYAN}本地 25 端口出站:${C_RESET} ${C_RED}阻断${C_RESET} ${mail_ok_list:+(远端可达: ${mail_ok_list})}" ;;
+            esac
+            if [[ "$stack" == "4" ]]; then
+                echo -e "  ${C_CYAN}DNSBL 黑名单 (${dnsbl_mode}):${C_RESET} 扫描 ${C_CYAN}${dnsbl_total}${C_RESET} 库  |  正常 ${C_GREEN}${dnsbl_clean}${C_RESET}  |  命中黑名单 $([[ $dnsbl_hits -gt 0 ]] && echo -e "${C_RED}${C_BOLD}${dnsbl_hits}${C_RESET}" || echo -e "${C_GREEN}0${C_RESET}")"
+                [[ -n "$dnsbl_hit_names" ]] && echo -e "  ${C_RED}${C_BOLD}命中黑名单列表:${C_RESET}   ${dnsbl_hit_names}"
+            else
+                echo -e "  ${C_CYAN}DNSBL 黑名单:${C_RESET}     ${C_DIM}仅适用于 IPv4（IPv6 自动跳过）${C_RESET}"
+            fi
+        fi
+        echo -e "${C_CYAN}${C_BOLD}${sep}${C_RESET}"
+        echo ""
+    } > "$report_ansi_file"
+
+    # 终端输出
+    if [[ "$JSON_MODE" -eq 1 ]]; then
+        echo "$report_json"
+    else
+        cat "$report_ansi_file"
+    fi
+
+    # 导出到本地文件（0600 权限）
+    if [[ -n "$out_path" ]]; then
+        case "$out_path" in
+            *.[aA][nN][sS][iI])
+                cat "$report_ansi_file" >> "$out_path"
+                ;;
+            *.[jJ][sS][oO][nN])
+                printf '%s\n' "$report_json" >> "$out_path"
+                ;;
+            *)
+                strip_ansi < "$report_ansi_file" >> "$out_path"
+                ;;
+        esac
+        chmod 600 "$out_path" 2>/dev/null || true
+    fi
+}
+
+# ==============================================================================
+# 任务调度：支持整机 / 多端口批量 / 指定网卡或出口 IP
+# ==============================================================================
+
 derive_output_path() {
     local base_path="$1"
     local idx="$2"
@@ -1282,82 +2346,112 @@ derive_output_path() {
     echo "${stem}_${idx}${ext}"
 }
 
-# 准备导出文件路径：若已存在旧同名文件则先清理（防止上游报错退出码 10）
 prepare_output_file() {
     local out_path="$1"
     [[ -z "$out_path" ]] && return 0
-    if [[ -f "$out_path" ]]; then
-        rm -f "$out_path" 2>/dev/null || true
-    fi
+    local old_umask
+    old_umask=$(umask)
+    umask 077
+    : > "$out_path"
+    chmod 600 "$out_path" 2>/dev/null || true
+    umask "$old_umask"
 }
 
-# 导出完成后收紧报告文件权限为 0600，防止同机其他非特权用户读取
-secure_output_file() {
+run_target_egress() {
     local out_path="$1"
-    [[ -z "$out_path" ]] && return 0
-    if [[ -f "$out_path" ]]; then
-        chmod 600 "$out_path" 2>/dev/null || true
+    local ip4="" ip6="" ran_any=0
+
+    if [[ "$IP_STACK" == "both" || "$IP_STACK" == "4" ]]; then
+        if ip4=$(fetch_egress_ipv4); then
+            run_single_ip_check "$ip4" "4" "$out_path"
+            ran_any=1
+        elif [[ "$IP_STACK" == "4" ]]; then
+            echo -e "${C_RED}[错误] 无法获取 IPv4 出口地址，请检查网络或代理/网卡设置。${C_RESET}" >&2
+            return 1
+        fi
     fi
+
+    if [[ "$IP_STACK" == "both" || "$IP_STACK" == "6" ]]; then
+        if ip6=$(fetch_egress_ipv6); then
+            run_single_ip_check "$ip6" "6" "$out_path"
+            ran_any=1
+        elif [[ "$IP_STACK" == "6" ]]; then
+            echo -e "${C_RED}[错误] 无法获取 IPv6 出口地址，请检查网络或代理/网卡设置。${C_RESET}" >&2
+            return 1
+        fi
+    fi
+
+    if [[ $ran_any -eq 0 ]]; then
+        echo -e "${C_RED}[错误] IPv4 与 IPv6 出口均不可达，请检查网络连接或目标配置。${C_RESET}" >&2
+        return 1
+    fi
+
+    if [[ -n "$out_path" && -f "$out_path" ]]; then
+        echo -e "${C_GREEN}[已保存] 报告已写入 ${out_path} (权限 0600)${C_RESET}" >&2
+    fi
+    return 0
 }
 
 execute_checks() {
     align_iface_ip_stack
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        echo -e "${C_YELLOW}[Dry-Run] 仅预览将执行的命令，不实际运行：${C_RESET}"
+        echo -e "${C_YELLOW}[Dry-Run] 预览模式，未发起实际网络检测。${C_RESET}"
         if [[ "$TARGET_MODE" == "port" ]]; then
             local i=1 total=${#TARGET_PORTS[@]} p out_path
             for p in "${TARGET_PORTS[@]}"; do
                 out_path=$(derive_output_path "$OUTPUT_FILE" "$i" "$total")
-                build_upstream_args "$p" "$out_path"
-                echo "  [$i/$total] $(format_preview_cmd)"
+                echo "  [$i/$total] 独立引擎检测代理: $(mask_proxy_url "$p")  (协议栈: ${IP_STACK}, 隐私模式: ${PRIVACY_MODE}${out_path:+, 导出: ${out_path}})"
                 i=$((i + 1))
             done
+        elif [[ "$TARGET_MODE" == "iface" ]]; then
+            echo "  独立引擎检测出口: $(format_iface_display "$TARGET_IFACE")  (协议栈: ${IP_STACK}, 隐私模式: ${PRIVACY_MODE}${OUTPUT_FILE:+, 导出: ${OUTPUT_FILE}})"
         else
-            build_upstream_args "" "$OUTPUT_FILE"
-            echo "  $(format_preview_cmd)"
+            echo "  独立引擎检测本机默认出口  (协议栈: ${IP_STACK}, 隐私模式: ${PRIVACY_MODE}${OUTPUT_FILE:+, 导出: ${OUTPUT_FILE}})"
         fi
         return 0
     fi
 
-    download_upstream_script
+    TMP_WORKDIR=$(make_temp_dir "ipzhiliang_work")
 
     if [[ "$TARGET_MODE" == "port" ]]; then
+        TMP_CURL_CFG=$(make_temp_file "ipzhiliang_curl")
         local i=1 total=${#TARGET_PORTS[@]} p out_path
-        local use_cfg_file=0
-        if grep -q 'IPZHILIANG_CURL_CFG' "$TMP_SCRIPT" 2>/dev/null; then
-            TMP_CURL_CFG=$(make_temp_file "ipzhiliang_curl")
-            use_cfg_file=1
-        fi
-
         for p in "${TARGET_PORTS[@]}"; do
             out_path=$(derive_output_path "$OUTPUT_FILE" "$i" "$total")
             prepare_output_file "$out_path"
+            printf 'proxy = "%s"\n' "$p" > "$TMP_CURL_CFG"
+            chmod 600 "$TMP_CURL_CFG" 2>/dev/null || true
+            ACTIVE_CURL_CFG="$TMP_CURL_CFG"
+            ACTIVE_IFACE=""
+            ACTIVE_PROXY_DISPLAY=$(mask_proxy_url "$p")
             echo ""
-            echo -e "${C_BOLD}${C_GREEN}>>> [${i}/${total}] 正在检测端口/代理: $(mask_proxy_url "$p")${C_RESET}"
-            if [[ $use_cfg_file -eq 1 ]]; then
-                printf 'proxy = "%s"\n' "$p" > "$TMP_CURL_CFG"
-                chmod 600 "$TMP_CURL_CFG" 2>/dev/null || true
-                # 命令行仅传入脱敏后的占位代理字符串，真实代理与密码经由 0600 配置文件读取，彻底杜绝 ps aux 泄露
-                build_upstream_args "$(mask_proxy_url "$p")" "$out_path"
-                IPZHILIANG_CURL_CFG="$TMP_CURL_CFG" "$BASH4_BIN" "$TMP_SCRIPT" "${UPSTREAM_ARGS[@]}"
-            else
-                build_upstream_args "$p" "$out_path"
-                "$BASH4_BIN" "$TMP_SCRIPT" "${UPSTREAM_ARGS[@]}"
-            fi
-            secure_output_file "$out_path"
+            echo -e "${C_BOLD}${C_GREEN}>>> [${i}/${total}] 正在独立检测代理出口: ${ACTIVE_PROXY_DISPLAY}${C_RESET}" >&2
+            run_target_egress "$out_path" || true
             i=$((i + 1))
         done
+    elif [[ "$TARGET_MODE" == "iface" ]]; then
+        prepare_output_file "$OUTPUT_FILE"
+        ACTIVE_CURL_CFG=""
+        ACTIVE_IFACE="$TARGET_IFACE"
+        ACTIVE_PROXY_DISPLAY=""
+        echo ""
+        echo -e "${C_BOLD}${C_GREEN}>>> 正在独立检测指定出口: $(format_iface_display "$TARGET_IFACE")${C_RESET}" >&2
+        run_target_egress "$OUTPUT_FILE"
     else
         prepare_output_file "$OUTPUT_FILE"
-        build_upstream_args "" "$OUTPUT_FILE"
+        ACTIVE_CURL_CFG=""
+        ACTIVE_IFACE=""
+        ACTIVE_PROXY_DISPLAY=""
         echo ""
-        echo -e "${C_BOLD}${C_GREEN}>>> 正在启动 IP 质量检测...${C_RESET}"
-        "$BASH4_BIN" "$TMP_SCRIPT" "${UPSTREAM_ARGS[@]}"
-        secure_output_file "$OUTPUT_FILE"
+        echo -e "${C_BOLD}${C_GREEN}>>> 正在启动独立 IP 质量体检...${C_RESET}" >&2
+        run_target_egress "$OUTPUT_FILE"
     fi
 }
 
-# 校验需要参数的 CLI 选项
+# ==============================================================================
+# CLI 参数解析与交互主循环
+# ==============================================================================
+
 require_opt_arg() {
     local opt_name="$1"
     local arg_count="$2"
@@ -1370,7 +2464,7 @@ require_opt_arg() {
 }
 
 parse_cli_args() {
-    local cli_privacy="" cli_full=0 cli_ports=""
+    local cli_full=0 cli_ports=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1405,15 +2499,16 @@ parse_cli_args() {
                 ;;
             --privacy)
                 NON_INTERACTIVE=1
-                cli_privacy="privacy"
+                PRIVACY_MODE="1"
                 shift
                 ;;
             --public)
                 NON_INTERACTIVE=1
-                cli_privacy="public"
+                echo -e "${C_YELLOW}[提示] IPzhiliang v2 已全面独立并彻底移除第三方报告上传，自动以纯本地隐私打码模式运行。${C_RESET}" >&2
+                PRIVACY_MODE="1"
                 shift
                 ;;
-            --full)
+            --full|-f)
                 NON_INTERACTIVE=1
                 cli_full=1
                 shift
@@ -1432,7 +2527,7 @@ parse_cli_args() {
                 require_opt_arg "$1" "$#" "${2:-}"
                 NON_INTERACTIVE=1
                 if ! LANG_CODE=$(normalize_lang_code "$2"); then
-                    echo -e "${C_RED}[错误] 不支持的语言代码: $2 (可选: cn|en|jp|es|de|fr|ru|pt)${C_RESET}"
+                    echo -e "${C_RED}[错误] 不支持的语言代码: $2 (可选: cn | en)${C_RESET}"
                     exit 1
                 fi
                 shift 2
@@ -1440,7 +2535,7 @@ parse_cli_args() {
             -l=*)
                 NON_INTERACTIVE=1
                 if ! LANG_CODE=$(normalize_lang_code "${1#*=}"); then
-                    echo -e "${C_RED}[错误] 不支持的语言代码: ${1#*=} (可选: cn|en|jp|es|de|fr|ru|pt)${C_RESET}"
+                    echo -e "${C_RED}[错误] 不支持的语言代码: ${1#*=} (可选: cn | en)${C_RESET}"
                     exit 1
                 fi
                 shift
@@ -1465,6 +2560,16 @@ parse_cli_args() {
             -j)
                 NON_INTERACTIVE=1
                 JSON_MODE=1
+                shift
+                ;;
+            --no-media)
+                NON_INTERACTIVE=1
+                SKIP_MEDIA=1
+                shift
+                ;;
+            --no-mail)
+                NON_INTERACTIVE=1
+                SKIP_MAIL=1
                 shift
                 ;;
             -y)
@@ -1494,18 +2599,12 @@ parse_cli_args() {
         esac
     done
 
-    # 组合 CLI 隐私参数
-    if [[ "$cli_privacy" == "public" && "$cli_full" -eq 1 ]]; then
-        PRIVACY_MODE="3"
-    elif [[ "$cli_privacy" == "public" ]]; then
+    if [[ "$cli_full" -eq 1 ]]; then
         PRIVACY_MODE="2"
-    elif [[ "$cli_full" -eq 1 ]]; then
-        PRIVACY_MODE="4"
     else
         PRIVACY_MODE="1"
     fi
 
-    # 解析 CLI 传入的 --port
     if [[ "$TARGET_MODE" == "port" ]]; then
         if [[ -z "$cli_ports" ]]; then
             echo -e "${C_RED}[错误] --port 需要提供端口号或代理地址。${C_RESET}"
@@ -1581,11 +2680,13 @@ interactive_loop() {
 main() {
     parse_cli_args "$@"
     check_env
-    print_banner
+    if [[ "$JSON_MODE" -eq 0 ]]; then
+        print_banner
+    fi
     check_self_update "$@"
 
     if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
-        show_summary
+        [[ "$JSON_MODE" -eq 0 ]] && show_summary
         execute_checks
     else
         interactive_loop

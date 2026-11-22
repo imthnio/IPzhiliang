@@ -1,10 +1,6 @@
-# IPzhiliang · IP 质量一键交互检测脚本
+# IPzhiliang · 独立开源隐私优先 IP 质量一键检测工具
 
-基于 [xykt/IPQuality](https://github.com/xykt/IPQuality)（`https://IP.Check.Place`）构建的中文交互式一键封装脚本，主打**零记忆参数、自动识别端口代理协议、清晰的隐私保护选项**，特别适合单机多出口、多端口代理分流（如端口 `21233` 走独立出口 IP）的 VPS 环境。
-
-<!-- UPSTREAM_STATUS_START -->
-> 上游同步状态：核心引擎 `v2026-11-07` · 上游提交 `8643bcd` · 黑名单数据库 `424` 条 · 最近自动同步 `2026-11-22T15:18:12Z`
-<!-- UPSTREAM_STATUS_END -->
+**100% 独立自研**的中文/英文交互式 IP 质量与 AI / 流媒体解锁检测脚本，主打**零第三方中转、零报告上传、零广告统计、全链路隐私脱敏、并发极速检测**，特别适合单机多出口、多端口代理分流（如端口 `21233` 走独立出口 IP）的 VPS 与本地环境。
 
 ## 一键运行（全系统通用）
 
@@ -12,55 +8,53 @@
 (command -v curl >/dev/null && curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/run.sh || wget -qO- https://raw.githubusercontent.com/imthnio/IPzhiliang/main/run.sh) | sh
 ```
 
-> 自动识别 Alpine / Debian / Ubuntu / CentOS / Rocky / Arch / macOS，无 `curl` 或无 `bash` 时会自动通过 `wget` 拉取并自动补齐依赖，全程免手动操作。
+> 自动识别 Alpine / Debian / Ubuntu / CentOS / Rocky / Arch / OpenWrt / FreeBSD / macOS，缺失 `curl` / `bash` / `jq` 时自动补齐；完整兼容 macOS 自带 Bash 3.2 与 Linux Bash 4/5，全程免手动配置。
 
-## 核心功能
+## 核心特点
 
-1. **灵活选择检测目标**
-   - **整台机器（默认出口）**：直接检测当前服务器默认公网出口。
-   - **指定端口（如 `21233`）**：
-     - 只需输入端口号（如 `21233`），脚本会**自动探测**该端口的代理协议（SOCKS5 / HTTP / HTTPS），并预览出口 IP。
-     - 支持**多端口批量检测**（英文逗号分隔，如 `21233,21234,21235`）。
-     - 支持带账号密码认证的代理，或直接输入完整代理 URL（`socks5://user:pass@127.0.0.1:21233`）。
-     - 自动展示当前本机监听端口供参考；若端口不通会给出排查提示（如 VLESS/VMess/Trojan 节点端口与 SOCKS5/HTTP 端口的区别）。
-   - **指定出口网卡或出口 IP**：自动列出本机可用网卡（如 `eth0`、`wg0`、`warp`）及地址，输入编号即可检测。
+### 1. 100% 独立引擎 · 真正隐私优先
+- **零中转 / 零上传 / 零广告 / 零打点**：所有检测直接由本机或指定代理向公开权威数据源与目标服务发起，绝不上传任何报告到第三方站点，无任何统计上报与广告请求。
+- **全链路 IP 与凭据脱敏**：
+  - 默认**隐私打码模式**，从实时进度条、网卡列表、监听端口提示到最终报告与 JSON 输出，全程保留首尾、中间段打码（如 `203.*.*.55`、`2409:8a20:*:*:f294`），录屏/截图绝不泄露完整公网 IP，且能清晰区分同 C 段多出口 IP；
+  - 代理账号密码经由 `0600` 权限临时配置文件通过 `curl -K` 传递，**绝不出现在 `ps aux` 进程列表中**，并自动对含 `@`、`:` 等特殊字符的密码进行 URL 编码；
+  - 代理模式下严格使用 `socks5h`（远端解析 DNS），**DNSBL 黑名单强制经由代理走 DoH (DNS-over-HTTPS) 扫描**，并自动跳过直连 25 端口探测，杜绝任何旁路 DNS / 宿主机 IP 泄露；
+  - 本地导出的 `.txt` / `.ansi` / `.json` 报告自动收紧为 `0600` 权限。
 
-2. **深度隐私加固与公开选项**
-   - **隐私保护模式（默认推荐）**：隐藏/打码 IP 地址，且**物理级阻断上传**公开报告链接（`-p`）。
-   - **公开分享模式（隐藏 IP）**：隐藏/打码 IP，生成可分享的 `Report.Check.Place` 公开报告链接。
-   - **公开完整模式**：展示完整 IP 地址，并生成公开报告链接（`-f`）。
-   - **本地完整模式**：仅在本地终端展示完整 IP，不上传公开报告链接（`-p -f`）。
-   - **全链路防泄露加固**：
-     - 修复上游在隐藏 IP 模式下**实时进度条仍暴露完整 IP** 的问题，全程首尾保留、中间段脱敏（如 `203.*.*.55`，既保护隐私又可区分同 C 段多出口 IP）；
-     - 修复上游在解析 `-x`/`-i`/`-4`/`-6` 参数前**裸连探测宿主机默认 IP** 的旁路泄露问题，确保代理/指定网卡模式下所有请求严格走目标出口；
-     - 代理账号密码通过 `0600` 权限临时配置传入 `curl -K`，**不在 `ps aux` 进程列表中暴露明文密码**；本地导出报告自动收紧为 `0600` 权限。
+### 2. 并发极速多维检测（约 6~12 秒完成全套体检）
+1. **基础信息融合校验**：融合 `IPinfo`、`IPQuery`、`ProxyCheck`、`IP-API`、`IP2Location` 多源互验，展示 ASN、组织/运营商、rDNS、实际使用地、注册归属地、**原生 IP / 广播 IP** 判定、时区与 Anycast 属性。
+2. **多库风控评分与综合纯净度评级**：并行直连 `Scamalytics`、`ProxyCheck`、`IPQuery` 计算 `0–100` 风险分与可视化进度条，并结合黑名单命中情况给出综合风控评级；支持通过环境变量 `ABUSEIPDB_API_KEY` / `IPQS_API_KEY` 扩展自有官方 Key 直连查询。
+3. **六源风险因子交叉矩阵**：横向交叉对比 `IPinfo` / `IPQuery` / `ProxyCheck` / `Scamalytics` / `IP-API` / `IP2Location` 的地区一致性、Proxy、VPN、Tor、机房/服务器、移动网络、爬虫标记。
+4. **AI 与流媒体并发解锁检测**：一键并发探测 **ChatGPT、Claude、Gemini、Netflix（区分全解锁/仅自制）、Disney+、YouTube Premium、TikTok、Amazon Prime Video、Reddit** 的解锁状态与地区。
+5. **邮局 25 端口与 22+ 权威 DNSBL 黑名单扫描**：内置 22 个经 RFC 5782 验证的权威公开 RBL 库并发扫描（命中时直接列出黑名单域名，方便排查申诉）。
 
-3. **更多贴心交互**
-   - **IP 协议版本选择**：双栈（IPv4 + IPv6）、仅 IPv4（`-4`）、仅 IPv6（`-6`）。
-   - **执行前总览与脱敏预览**：开始检测前展示完整配置与等价命令（自动隐藏代理密码），支持按 `a` 进入高级选项、按 `r` 重新配置、按 `Enter` 直接开测。
-   - **高级选项（按 `a`）**：切换报告语言（中/英/日/西/德/法/俄/葡）、导出报告到本地文件（`.txt` / `.ansi` / `.json`，多端口自动编号防覆盖）、终端 JSON 输出、依赖自动安装/跳过策略。
-   - **自动同步最新数据库与引擎**：
-     - 每次运行都会绕过缓存实时拉取最新 `IP.Check.Place` 引擎及黑名单/风险库，并在终端显示当前同步的上游版本号；
-     - 仓库内置 GitHub Actions（`.github/workflows/sync-upstream.yml`），每日自动追踪 `xykt/IPQuality` 与数据库更新并同步 `upstream_meta.json`；若上游新增命令行参数，还会自动创建 Issue 提醒适配；
-     - 本地保存的 `ipzhiliang.sh` 启动时自动检查新版本，也支持 `bash ipzhiliang.sh --update` 一键自更新。
-   - **双源容错**：优先从 `https://IP.Check.Place` 拉取最新检测引擎，超时自动切换至 GitHub 备用源。
+### 3. 灵活的目标选择与多端口批量检测
+- **整台机器（默认出口）**：直接检测当前机器 IPv4 / IPv6 公网出口。
+- **指定端口 / 代理（如 `21233`）**：
+  - 只需输入端口号（如 `21233`），自动探测 `SOCKS5H` / `HTTP` / `HTTPS` 协议并预览脱敏出口 IP；
+  - 支持**多端口逗号分隔批量检测**（如 `21233,21234,21235`），自动顺序输出结果且互不清屏覆盖；
+  - 支持账号密码认证及完整代理 URL（`socks5h://user:pass@127.0.0.1:21233`）。
+- **指定网卡或指定出口 IP**：自动列出本机网卡与脱敏 IPv4/IPv6 地址，输入编号即可精准绑定检测，并自动对齐 IPv4/IPv6 协议栈。
 
 ## 命令行快捷模式
 
-除了默认交互菜单，也支持通过参数直接运行：
-
 ```bash
-# 仅测 21233 端口（自动探测协议 + 默认隐私模式）
+# 仅测本机默认出口 IPv4（隐私打码模式）
+bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh) -4
+
+# 仅测 21233 端口（自动探测协议 + 隐私打码模式）
 bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh) --port 21233
 
-# 批量检测多个端口，且生成公开报告链接
-bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh) --port 21233,21234 --public
+# 批量检测多个端口并导出脱敏报告（自动生成 report_1.txt / report_2.txt，权限 0600）
+bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh) --port 21233,21234 -o report.txt
 
-# 检测指定网卡（如 warp）的 IPv4，隐私模式并保存报告
-bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh) --iface warp -4 --privacy -o report.txt
+# 检测指定网卡（如 warp）并输出结构化 JSON
+bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh) --iface warp -4 -j
 
-# 仅预览最终命令，不实际执行
-bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh) --port 21233 --dry-run
+# 仅本地查看完整 IP（不上传，零中转）
+bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh) --full
+
+# 可选：携带自有官方 API Key 启用 AbuseIPDB / IPQS 直连扩展
+ABUSEIPDB_API_KEY="your_key" IPQS_API_KEY="your_key" bash ipzhiliang.sh -4
 
 # 查看全部参数
 bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhiliang.sh) --help
@@ -68,10 +62,10 @@ bash <(curl -Ls https://raw.githubusercontent.com/imthnio/IPzhiliang/main/ipzhil
 
 ## 依赖要求
 
-- `curl`
-- `bash >= 4.0`（上游检测引擎要求；macOS 若使用系统自带 Bash 3.2，可通过 `brew install bash` 安装，脚本会自动识别）
+- `bash`（完整兼容 Bash 3.2+，macOS 无需升级 Bash 即可直接运行）
+- `curl`、`jq`（通过 `run.sh` 一键运行或默认 `-y` 模式下自动安装）
+- 可选：`dig`、`nc`（用于直连模式 DNSBL 与 25 端口探测；缺失时 DNSBL 自动回退至 DoH）
 
-## 致谢与许可
+## 开源许可
 
-- 核心 IP 质量检测能力由开源项目 [xykt/IPQuality](https://github.com/xykt/IPQuality) 提供（遵循 GNU AGPL-3.0 协议），本脚本在运行时动态拉取其最新版本执行。
-- 本仓库的交互封装脚本采用 [MIT License](./LICENSE) 开源。
+本项目采用 [MIT License](./LICENSE) 开源，所有核心代码与黑名单配置均为独立实现。

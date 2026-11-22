@@ -2,7 +2,7 @@
 # ==============================================================================
 # IPzhiliang 通用自举入口脚本 (POSIX sh)
 # 自动识别系统 (Alpine / Debian / Ubuntu / CentOS / Rocky / Arch / OpenWrt / FreeBSD / macOS)
-# 自动补齐 bash (>=4.0) 与 curl，再拉取并运行最新 ipzhiliang.sh
+# 自动补齐 bash / curl / jq，再拉取并运行最新独立版 ipzhiliang.sh
 # ==============================================================================
 
 set -u
@@ -24,30 +24,17 @@ if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
     SUDO="sudo"
 fi
 
-# 查找可用的 bash >= 4.0
-find_bash4() {
+# 查找可用的 bash（优先较新版本，同时完整兼容 macOS 自带 Bash 3.2）
+find_bash() {
     for b in /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
         if [ -x "$b" ]; then
-            ver=$("$b" -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null || echo 0)
-            case "$ver" in
-                ''|*[!0-9]*) ver=0 ;;
-            esac
-            if [ "$ver" -ge 4 ]; then
-                echo "$b"
-                return 0
-            fi
-        fi
-    done
-    if command -v bash >/dev/null 2>&1; then
-        b=$(command -v bash)
-        ver=$("$b" -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null || echo 0)
-        case "$ver" in
-            ''|*[!0-9]*) ver=0 ;;
-        esac
-        if [ "$ver" -ge 4 ]; then
             echo "$b"
             return 0
         fi
+    done
+    if command -v bash >/dev/null 2>&1; then
+        command -v bash
+        return 0
     fi
     return 1
 }
@@ -82,21 +69,24 @@ install_pkg() {
     fi
 }
 
-# 1. 自动检查并补齐 curl 与 bash (>=4.0)
+# 1. 自动检查并补齐 curl / bash / jq
 NEED_PKGS=""
 if ! command -v curl >/dev/null 2>&1; then
     NEED_PKGS="$NEED_PKGS curl"
 fi
-if ! find_bash4 >/dev/null 2>&1; then
+if ! find_bash >/dev/null 2>&1; then
     NEED_PKGS="$NEED_PKGS bash"
+fi
+if ! command -v jq >/dev/null 2>&1; then
+    NEED_PKGS="$NEED_PKGS jq"
 fi
 
 if [ -n "$NEED_PKGS" ]; then
     install_pkg $NEED_PKGS
 fi
 
-BASH4_BIN=$(find_bash4) || {
-    printf "\033[31m[错误] 未能安装或找到 Bash 4.0+，请手动升级 Bash 后重试。\033[0m\n"
+BASH_BIN=$(find_bash) || {
+    printf "\033[31m[错误] 未能安装或找到 Bash，请手动安装后重试。\033[0m\n"
     exit 1
 }
 
@@ -129,10 +119,10 @@ if [ ! -s "$TMP_MAIN" ] || ! grep -q "IPzhiliang" "$TMP_MAIN" 2>/dev/null; then
     exit 1
 fi
 
-# 3. 使用 Bash 4+ 运行主脚本（标记已由自举脚本拉取最新版，避免重复检查自更新；安全检测控制终端）
+# 3. 运行主脚本（标记已由自举脚本拉取最新版，避免重复检查自更新；安全检测控制终端）
 export IPZHILIANG_BOOTSTRAPPED=1
 if (: </dev/tty) 2>/dev/null; then
-    "$BASH4_BIN" "$TMP_MAIN" "$@" </dev/tty
+    "$BASH_BIN" "$TMP_MAIN" "$@" </dev/tty
 else
-    "$BASH4_BIN" "$TMP_MAIN" "$@"
+    "$BASH_BIN" "$TMP_MAIN" "$@"
 fi

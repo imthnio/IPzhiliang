@@ -1,9 +1,0 @@
-{
-  "upstream_repo": "xykt/IPQuality",
-  "script_version": "v2026-11-07",
-  "upstream_commit": "8643bcd0a0b7b42ed53030f794d63ce72067ca77",
-  "getopts_spec": "i:l:o:x:fhjnpyEM46",
-  "dnsbl_entries": 424,
-  "db_bundle_sha256": "654f3cbe2d69ff45d5be71b6ca3041db6318f64c35d6c31d99efe4a940666de6",
-  "last_checked_utc": "2026-11-22T15:18:12Z"
-}
